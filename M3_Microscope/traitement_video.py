@@ -6,17 +6,17 @@ from scipy import ndimage as ndi
 from scipy.optimize import curve_fit, linear_sum_assignment
 
 DOSSIER_VIDEOS = Path(r"M3_Microscope\videos_20261026")
-NOM_VIDEO = "gab.mp4"
+NOM_VIDEO = "20X.mp4"
 # pour dense_up.mp4, on ne détecte aucune particule
 # pour gab.mp4, on ne détecte aucune particule
 # pour 20X on détecte bien les 6 particules : a = 1.257 µm  ± 0.088 µm (σ_PSF = 0.008 ⊕ σ_stat = 0.088), 6 particules, χ²_red = 1.76
 # dense_up_contraste.mp4, grossissement 4X, on détecte 15 particules : a = 0.400 µm  ± 0.022 µm (σ_PSF = 0.008 ⊕ σ_stat = 0.021), 17 particules, χ²_red = 349.89
-
+# dense_up_contraste.mp4, grossissement 10X, on détecte 15 particules : 2.499 µm  ± 0.140 µm (σ_PSF = 0.052 ⊕ σ_stat = 0.130), 17 particules, χ²_red = 349.89
 # constantes
 kB = 1.380649e-23          # J/K
 T = 22 + 273               # K
 ETA = 0.95e-3              # Pa·s (eau à 22 °C)
-GROSSISSEMENT = 4         # X
+GROSSISSEMENT = 20         # X
 TAILLE_PIXEL = 1.55e-6     # m
 REDUCTION = 4056 / 640     # nbr pixels image / nbr pixels capteur (car on n'est pas à la résolution maximale)
 PIXEL_EFF = TAILLE_PIXEL * REDUCTION / GROSSISSEMENT        # m/pixel dans le plan objet
