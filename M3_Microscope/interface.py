@@ -937,6 +937,8 @@ class Application(ttk.Frame):
         self._onglet_acquisition(t1)
         self._onglet_enregistrement(t2)
         self._onglet_analyse(t3)
+        self._sur_source()          # seulement maintenant : tous les widgets (température, boutons...) existent
+        self._sur_changement()
 
     def _carte_resultat(self, parent):
         cadre = ttk.Frame(parent, style="Carte.TFrame", padding=10)
@@ -1030,8 +1032,6 @@ class Application(ttk.Frame):
         self.btn_acq.pack(fill="x", pady=(10, 4))
         self.btn_capture = ttk.Button(p, text="Capturer une image", command=self._capturer)
         self.btn_capture.pack(fill="x")
-        self._sur_source()
-        self._sur_changement()
 
     def _onglet_enregistrement(self, p):
         self.var_dossier = tk.StringVar(value=str(Path(__file__).resolve().parent / "enregistrements"))
@@ -1173,6 +1173,8 @@ class Application(ttk.Frame):
         self.btn_acq.configure(text="■  Arrêter l'acquisition" if marche else "▶  Démarrer l'acquisition",
                                style="Stop.TButton" if marche else "Go.TButton")
         self.btn_capture.state(["!disabled"] if marche else ["disabled"])
+        if not hasattr(self, "btn_enr"):               # appelé pendant la construction, avant l'onglet Enregistrement
+            return
         self.btn_enr.state(["!disabled"] if marche else ["disabled"])
         self.btn_enr.configure(text="■  Arrêter l'enregistrement" if enr else "●  Démarrer l'enregistrement",
                                style="Stop.TButton" if enr else "Rec.TButton")
