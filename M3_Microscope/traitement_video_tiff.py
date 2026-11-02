@@ -480,7 +480,7 @@ def afficher_resultats(frames, resultats, final):
 #############################################################################################################
 
 if __name__ == "__main__":
-    chemin = DOSSIER_VIDEOS / NOM_VIDEO
+    chemin =chemin = r"C:\Users\Aiya Hamrouni\OneDrive\Documents\TechEx\TechEx\M3_Microscope\acq_2026-11-02_13h21m47_B_20X.tif"
     frames, fps = charger_media(chemin)          # vidéo (mp4, avi...) ou TIFF (fichier / dossier)
     s = stats_video(frames, fps)
 
@@ -490,7 +490,7 @@ if __name__ == "__main__":
     print(f"Frame rate       : {s['fps']:.2f} fps")
     print(f"Durée            : {s['duree_s']:.2f} s")
 
-    INDICE_FRAME = 120   # à modifier
+    INDICE_FRAME = min(120, len(frames) - 1)   # ou simplement 0, 10, 25...
     gris = afficher_frame(frames, INDICE_FRAME, s["fps"])
 
     particules = compter_particules(gris, indice=INDICE_FRAME)
