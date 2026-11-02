@@ -23,9 +23,10 @@ Dans le terminal : Entrée = démarrer / arrêter, q + Entrée = quitter.
 Sans fenêtre possible (SSH), le script fonctionne quand même avec le terminal seulement.
 
 Sorties (dossier courant), nom horodaté pour ne jamais rien écraser :
-    acq_AAAA-MM-JJ_HHhMMmSS_<option>_<grossissement>X.tif   pile multipage non compressée (A à D)
-    acq_..._E_..X/frame_0000.png ...                         un PNG par image (E)
-    acq_....json   horodatages, exposition, gain, grossissement, fps réel, images perdues
+    <nom>_AAAA-MM-JJ_HHhMMmSS_<option>_<grossissement>X.tif   pile multipage non compressée (A à D)
+    <nom>_..._E_..X/frame_0000.png ...                         un PNG par image (E)
+    <nom>_....json   horodatages, exposition, gain, grossissement, fps réel, images perdues
+<nom> est demandé au lancement en mode enregistrement (Entrée = « acq »).
 
 Dépendances sur la Pi : picamera2, numpy, opencv (déjà utilisés), et tifffile pour A à D :
     sudo apt install python3-tifffile
@@ -102,6 +103,15 @@ def choisir_mode():
         print("  Taper a ou e.")
 
 
+def choisir_nom():
+    """Nom de base des fichiers. La date et l'heure sont ajoutées : rien n'est jamais écrasé."""
+    rep = input("Nom des fichiers [Entrée = acq] : ").strip()
+    propre = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in rep).strip("._")
+    if rep and propre != rep:
+        print(f"  Nom ajusté : {propre}")
+    return propre or "acq"
+
+
 def choisir_grossissement():
     while True:
         rep = input(f"Grossissement de l'objectif [Entrée = {GROSSISSEMENT_DEFAUT}] : ").strip()
@@ -155,12 +165,12 @@ def bilan_temps(stamps_ns, durees_us):
 class Enregistreur:
     """Un enregistrement : reçoit les images une à une, écrit les fichiers et le .json à la fin."""
 
-    def __init__(self, lettre, opt, forme, dtype, n_max, grossissement, consignes):
+    def __init__(self, lettre, opt, forme, dtype, n_max, grossissement, consignes, nom):
         self.lettre, self.opt, self.n_max = lettre, opt, n_max
         self.forme, self.dtype = forme, dtype
         self.grossissement, self.consignes = grossissement, consignes
         date = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%S")
-        self.base = DOSSIER_SORTIE / f"acq_{date}_{lettre}_{grossissement}X"
+        self.base = DOSSIER_SORTIE / f"{nom}_{date}_{lettre}_{grossissement}X"
         self.images, self.stamps, self.expos, self.gains, self.durees = [], [], [], [], []
         self.n = 0
         if opt["ecriture"] == "continue":
@@ -196,10 +206,16 @@ class Enregistreur:
             fichier = self.base.with_suffix(".tif")
         elif self.opt["format"] == "tif":
             fichier = self.base.with_suffix(".tif")
-            print(f"Écriture de {self.n} images dans {fichier.name}...", flush=True)
+            volume = self.n * self.images[0].nbytes / 1e9 if self.images else 0
+            print(f"\nÉcriture de {self.n} images ({volume:.1f} Go) dans {fichier.name}. "
+                  f"Sur une clé USB, ça peut prendre plusieurs minutes...", flush=True)
             with tifffile.TiffWriter(fichier, bigtiff=True) as tif:
-                for img in self.images:
+                for k, img in enumerate(self.images, 1):
                     tif.write(img, contiguous=True)
+                    if k % max(1, self.n // 10) == 0 or k == self.n:
+                        ecoule = time.time() - t0
+                        print(f"  {k}/{self.n} images écrites ({ecoule:.0f} s, "
+                              f"{k * img.nbytes / 1e6 / max(ecoule, 1e-3):.0f} Mo/s)", flush=True)
         else:                                            # E : ancienne méthode, un PNG par image
             fichier = self.base
             fichier.mkdir()
@@ -265,7 +281,7 @@ class Etat:
         self.basculer = threading.Event()
 
 
-def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consignes):
+def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consignes, nom):
     rec = None
     derniers = []
     taille = int(np.prod(forme)) * 2
@@ -302,7 +318,7 @@ def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consign
                                 print(f"\nRAM libre : {libre / 1e9:.1f} Go -> limité à {n_ram} images "
                                       f"(au lieu de {n_max})")
                                 n_max = n_ram
-                    rec = Enregistreur(lettre, opt, forme, img.dtype, n_max, grossissement, consignes)
+                    rec = Enregistreur(lettre, opt, forme, img.dtype, n_max, grossissement, consignes, nom)
                     with etat.verrou:
                         etat.enregistre, etat.n_rec, etat.n_max_rec = True, 0, n_max
                     fin = f"{n_max} images max" if n_max else "Entrée pour arrêter"
@@ -436,6 +452,7 @@ def main():
     opt = OPTIONS[lettre]
     mode = choisir_mode()
     grossissement = choisir_grossissement() if mode == "enregistrement" else None
+    nom = choisir_nom() if mode == "enregistrement" else None
 
     if mode == "enregistrement" and opt["format"] == "tif" and tifffile is None:
         sys.exit("Le module tifffile manque. Sur la Pi : sudo apt install python3-tifffile "
@@ -483,7 +500,7 @@ def main():
     titre = f"Microscope - option {lettre} ({'enregistrement' if mode == 'enregistrement' else 'apercu'})"
     fenetre = fenetre_possible(titre)
     cam = threading.Thread(target=boucle_camera,
-                           args=(picam2, etat, lettre, opt, mode, forme, grossissement, consignes))
+                           args=(picam2, etat, lettre, opt, mode, forme, grossissement, consignes, nom))
     cam.start()
     threading.Thread(target=lire_terminal, args=(etat,), daemon=True).start()
 
