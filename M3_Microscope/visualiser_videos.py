@@ -15,7 +15,6 @@ Au lancement : on choisit UNE vidéo et un fps dans le terminal. La vidéo joue 
 boucle (même image à trois échelles + histogramme de toute la vidéo) jusqu'à ce qu'on
 ferme la fenêtre. Barre d'espace = pause / reprise.
 Bonjour test111
-ouiiiiii
 """
 from pathlib import Path
 import cv2
