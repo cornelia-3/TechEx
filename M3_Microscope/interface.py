@@ -61,7 +61,7 @@ except ImportError:
 
 NOM_APP = "Suivi de particules – PHS3910"
 LARGEUR_CAPTEUR_PX = 4056                         # IMX477 (caméra HQ) : 4056 × 3040, pixels de 1,55 µm
-GROSSISSEMENTS = [2, 4, 10, 20, 40, 60]
+GROSSISSEMENTS = [2, 4, 10,16, 20, 40, 60]
 OUVERTURE_NUM = {2: 0.06, 4: 0.10, 10: 0.25, 20: 0.40, 40: 0.65, 60: 0.85}   # valeurs typiques (simulation)
 RESOLUTIONS = {"640 × 480": (640, 480), "1014 × 760": (1014, 760), "2028 × 1520": (2028, 1520)}
 EXTENSIONS_FICHIERS = "*.mp4 *.avi *.mov *.mkv *.tif *.tiff"
@@ -77,6 +77,33 @@ def couleur_piste(pid):
 def viscosite_eau(T_C):
     """Viscosité dynamique de l'eau (Pa·s), relation de Vogel. ≈ 0,95 mPa·s à 22 °C."""
     return 2.414e-5 * 10 ** (247.8 / (T_C + 273.15 - 140.0))
+
+
+def filtrer_aberrantes(liste, seuil=3.0, n_min_particules=4):
+    """Repère (sans rien supprimer : SUGGESTION seulement, l'utilisateur décide) les particules dont le rayon est aberrant (poussière, amas, particule d'une autre taille, mauvais suivi).
+
+    Critère robuste (insensible aux valeurs extrêmes) : on garde une particule si
+        |a − médiane(a)| ≤ seuil × √(σ_MAD² + médiane(σ_tot)²)
+    où σ_MAD = 1,4826 × MAD est la dispersion robuste des rayons, et médiane(σ_tot) la incertitude typique d'une mesure
+    (elle évite un seuil trop serré quand toutes les particules sont très semblables).
+    Sont aussi rejetées d'office les valeurs non physiques (rayon non fini ou ≤ 0).
+    Sous `n_min_particules`, la statistique est trop pauvre : on ne rejette que les valeurs non physiques.
+    Retourne (gardées, rejetées)."""
+    if not liste:
+        return [], []
+    a = np.array([r["a"] for r in liste], dtype=float)
+    physique = np.isfinite(a) & (a > 0)
+    ok = physique.copy()
+    if physique.sum() >= n_min_particules:
+        ap = a[physique]
+        med = np.median(ap)
+        sig_mad = 1.4826 * np.median(np.abs(ap - med))
+        inc_typ = np.median([r["inc"] for r, p in zip(liste, physique) if p])
+        tolerance = seuil * math.sqrt(sig_mad ** 2 + inc_typ ** 2)
+        ok &= np.abs(a - med) <= tolerance
+    gardees = [r for r, o in zip(liste, ok) if o]
+    rejetees = [r for r, o in zip(liste, ok) if not o]
+    return gardees, rejetees
 
 
 #############################################################################################################
@@ -117,6 +144,7 @@ class ParamsAnalyse:
     n_min: int = 20               # nombre minimal d'images par trajectoire utilisée
     lag_max: int = 3              # délais utilisés pour l'ajustement du MSD
     fenetre: int = 300            # nombre maximal d'images par trajectoire dans l'analyse (borne le temps de calcul)
+    seuil_rejet: float = 3.0      # seuil de la suggestion « suspecte » (écart à la médiane, en σ robuste MAD)
 
 
 @dataclass
@@ -851,6 +879,7 @@ class Application(ttk.Frame):
         self._photo = self._item = None
         self._dernier_num, self._version_res, self._fig_a_jour = -1, -1, False
         self._t_stats, self._map, self._img_courante = 0.0, (0, 0, 1.0), None
+        self.exclues, self._gen_vue = set(), 0           # pistes exclues PAR L'UTILISATEUR
         self._style()
         self._construire()
         self._maj_etats()
@@ -903,14 +932,27 @@ class Application(ttk.Frame):
         self.ax_msd = self.fig.add_subplot(1, 2, 1)
         self.ax_a = self.fig.add_subplot(1, 2, 2)
         self.canvas_fig = FigureCanvasTkAgg(self.fig, master=ana)
-        self.canvas_fig.get_tk_widget().pack(fill="both", expand=True)
-        cols = ("piste", "n_pts", "D", "sigma_exp", "a", "s_psf", "s_stat", "s_tot")
-        tetes = ("Piste", "Images", "D (µm²/s)", "σ_exp (nm)", "a (µm)", "σ_PSF (µm)", "σ_stat (µm)", "σ_tot (µm)")
-        self.tableau = ttk.Treeview(ana, columns=cols, show="headings", height=6)
+        cols = ("inclus", "piste", "n_pts", "D", "sigma_exp", "a", "s_psf", "s_stat", "s_tot", "flag")
+        tetes = ("Inclure", "Piste", "Images", "D (µm²/s)", "σ_exp (nm)", "a (µm)", "σ_PSF (µm)", "σ_stat (µm)",
+                 "σ_tot (µm)", "Suggestion")
+        self.tableau = ttk.Treeview(ana, columns=cols, show="headings", height=6, selectmode="extended")
         for c, t in zip(cols, tetes):
             self.tableau.heading(c, text=t)
-            self.tableau.column(c, width=90, anchor="center")
-        self.tableau.pack(fill="x", padx=4, pady=4)
+            self.tableau.column(c, width=62 if c in ("inclus", "piste", "n_pts") else 84, anchor="center")
+        self.tableau.tag_configure("exclue", foreground="#9e9e9e")
+        self.tableau.tag_configure("suspecte", foreground="#e65100")
+        self.tableau.bind("<Double-1>", self._dbl_clic)
+        # le tableau et ses boutons sont empaquetés EN BAS d'abord : ils restent visibles, la figure prend le reste
+        ttk.Label(ana, foreground="#555", text="Double-clic sur une ligne : inclure / exclure.   Orange = suspecte "
+                  "(suggestion seulement, rien n'est exclu sans ton accord).   Gris = exclue du rayon moyen."
+                  ).pack(side="bottom", anchor="w", padx=4)
+        bt = ttk.Frame(ana)
+        bt.pack(side="bottom", fill="x", padx=4, pady=4)
+        for txt, act in (("Exclure la sélection", "exclure"), ("Inclure la sélection", "inclure"),
+                         ("Exclure les suspectes", "suspectes"), ("Tout inclure", "tout")):
+            ttk.Button(bt, text=txt, command=lambda a=act: self._maj_exclusion(a)).pack(side="left", padx=(0, 4))
+        self.tableau.pack(side="bottom", fill="x", padx=4, pady=(4, 0))
+        self.canvas_fig.get_tk_widget().pack(fill="both", expand=True)
 
         self.var_etat = tk.StringVar(value="Prêt.")
         self.var_stats = tk.StringVar(value="")
@@ -928,6 +970,11 @@ class Application(ttk.Frame):
         droite.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
         droite.grid_propagate(False)
         self._carte_resultat(droite).pack(fill="x")
+        # boutons principaux : empaquetés en bas AVANT le carnet d'onglets pour rester toujours visibles
+        self.btn_capture = ttk.Button(droite, text="Capturer une image", command=self._capturer)
+        self.btn_capture.pack(side="bottom", fill="x", pady=(4, 0))
+        self.btn_acq = ttk.Button(droite, text="▶  Démarrer l'acquisition", style="Go.TButton", command=self._basculer_acq)
+        self.btn_acq.pack(side="bottom", fill="x", pady=(8, 0))
         self.ctl = ttk.Notebook(droite)
         self.ctl.pack(fill="both", expand=True, pady=(8, 0))
         t1, t2, t3 = ttk.Frame(self.ctl, padding=6), ttk.Frame(self.ctl, padding=6), ttk.Frame(self.ctl, padding=6)
@@ -1027,11 +1074,6 @@ class Application(ttk.Frame):
         ttk.Checkbutton(aff, text="Détections (cercles rouges)", variable=self.var_dets).pack(anchor="w")
         ttk.Checkbutton(aff, text="Étirer le contraste (affichage seulement)", variable=self.var_etirer).pack(anchor="w")
 
-        # --- boutons
-        self.btn_acq = ttk.Button(p, text="▶  Démarrer l'acquisition", style="Go.TButton", command=self._basculer_acq)
-        self.btn_acq.pack(fill="x", pady=(10, 4))
-        self.btn_capture = ttk.Button(p, text="Capturer une image", command=self._capturer)
-        self.btn_capture.pack(fill="x")
 
     def _onglet_enregistrement(self, p):
         self.var_dossier = tk.StringVar(value=str(Path(__file__).resolve().parent / "enregistrements"))
@@ -1094,6 +1136,13 @@ class Application(ttk.Frame):
             sp.grid(row=i, column=1, padx=6, pady=1)
             sp.bind("<Return>", self._sur_pa)
             sp.bind("<FocusOut>", self._sur_pa)
+        ttk.Label(av, text="Seuil « suspecte » (σ robuste)").grid(row=len(champs), column=0, sticky="w", pady=1)
+        v = tk.StringVar(value=str(self.pa.seuil_rejet))
+        self.vars_pa["seuil_rejet"] = v
+        sp = ttk.Spinbox(av, from_=1, to=10, increment=0.5, textvariable=v, width=7, command=self._sur_pa)
+        sp.grid(row=len(champs), column=1, padx=6, pady=1)
+        sp.bind("<Return>", self._sur_pa)
+        sp.bind("<FocusOut>", self._sur_pa)
         av.columnconfigure(0, weight=1)
         ttk.Button(p, text="Réinitialiser le suivi", command=self._reinit).pack(fill="x", pady=(4, 2))
         ttk.Button(p, text="Exporter l'analyse (CSV + figure)", command=self._exporter).pack(fill="x")
@@ -1231,6 +1280,8 @@ class Application(ttk.Frame):
                 self.var_echelle_man.set(f"{c.echelle_manuelle_um:.4f}")
             self.cb_bits.set("8 bits" if c.bits <= 8 else "12 bits (RAW)")
         self._version_res, self._dernier_num, self._fig_a_jour = -1, -1, False
+        self.exclues.clear()
+        self._gen_vue = self.moteur._gen
         self._maj_etats()
         self._sur_changement()
         self.var_etat.set(f"Acquisition en cours — {self.moteur.source.nom}")
@@ -1268,33 +1319,39 @@ class Application(ttk.Frame):
 
     def _reinit(self):
         self.moteur.reinitialiser()
+        self.exclues.clear()
         self._version_res = -1
         self.var_etat.set("Suivi réinitialisé.")
 
     def _exporter(self):
-        liste, final, _ = self.moteur.resultats()
+        liste, gardees, final, _ = self._resultats_utilisateur()
         if not liste:
             messagebox.showinfo("Rien à exporter", "Aucune trajectoire analysée pour l'instant.")
+            return
+        if final is None:
+            messagebox.showinfo("Rien à exporter", "Aucune particule n'est incluse : inclus-en au moins une dans le tableau.")
             return
         dossier = Path(self.var_dossier.get())
         dossier.mkdir(parents=True, exist_ok=True)
         base = dossier / ("analyse_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
         with open(base.with_suffix(".csv"), "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["piste", "images", "D_um2_s", "sigma_exp_nm", "a_um", "sigma_PSF_um", "sigma_stat_um", "sigma_tot_um"])
+            w.writerow(["incluse", "piste", "images", "D_um2_s", "sigma_exp_nm", "a_um", "sigma_PSF_um", "sigma_stat_um", "sigma_tot_um"])
             for r in liste:
-                w.writerow([r["piste"], r["n_pts"], f"{r['D'] * 1e12:.5f}", f"{r['sigma_exp'] * 1e9:.1f}", f"{r['a'] * 1e6:.5f}",
-                            f"{r['inc_psf'] * 1e6:.5f}", f"{r['inc_stat'] * 1e6:.5f}", f"{r['inc'] * 1e6:.5f}"])
+                w.writerow(["non" if r["piste"] in self.exclues else "oui", r["piste"], r["n_pts"], f"{r['D'] * 1e12:.5f}",
+                            f"{r['sigma_exp'] * 1e9:.1f}", f"{r['a'] * 1e6:.5f}", f"{r['inc_psf'] * 1e6:.5f}",
+                            f"{r['inc_stat'] * 1e6:.5f}", f"{r['inc'] * 1e6:.5f}"])
             w.writerow([])
             w.writerow(["rayon_final_um", f"{final['a'] * 1e6:.5f}", "incertitude_um", f"{final['inc'] * 1e6:.5f}",
-                        "chi2_red", f"{final['chi2_red']:.3f}", "n_particules", final["n"]])
+                        "chi2_red", f"{final['chi2_red']:.3f}", "n_particules_incluses", final["n"], "n_exclues", len(liste) - len(gardees)])
         self._dessiner_figure()
         self.fig.savefig(base.with_suffix(".png"), dpi=150)
         c = self.moteur.cond
         base.with_suffix(".json").write_text(json.dumps(
             {"conditions": {**asdict(c), "echelle_um_px": c.echelle_um_px()}, "analyse": asdict(self.pa),
              "rayon_um": final["a"] * 1e6, "incertitude_um": final["inc"] * 1e6, "chi2_red": final["chi2_red"],
-             "n_particules": final["n"], "sigma_psf_px": final.get("sigma_psf_px")}, indent=2, ensure_ascii=False), encoding="utf-8")
+             "n_particules": final["n"], "pistes_exclues": sorted(self.exclues),
+             "sigma_psf_px": final.get("sigma_psf_px")}, indent=2, ensure_ascii=False), encoding="utf-8")
         self.var_etat.set(f"Analyse exportée : {base.name}.csv / .png / .json")
 
     def _quitter(self):
@@ -1404,27 +1461,78 @@ class Application(ttk.Frame):
             self.prog["value"] = 0
             self._maj_etats()
 
-    def _maj_resultats(self):
-        liste, final, version = self.moteur.resultats()
-        if version == self._version_res:
+    def _resultats_utilisateur(self):
+        """(toutes les pistes analysées, pistes incluses, rayon final calculé sur les incluses, version)."""
+        liste, _, version = self.moteur.resultats()
+        gardees = [r for r in liste if r["piste"] not in self.exclues]
+        final = None
+        if gardees:
+            try:
+                with np.errstate(all="ignore"):
+                    final = tp.rayon_final(gardees)
+                final["sigma_psf_px"] = self.moteur.sigma_psf
+            except (ValueError, ZeroDivisionError, FloatingPointError, np.linalg.LinAlgError):
+                final = None
+        return liste, gardees, final, version
+
+    def _ids_suspects(self, liste):
+        return {r["piste"] for r in filtrer_aberrantes(liste, self.pa.seuil_rejet)[1]}
+
+    def _maj_exclusion(self, action):
+        liste = self.moteur.resultats()[0]
+        sel = [int(i) for i in self.tableau.selection()]
+        if action == "exclure":
+            self.exclues.update(sel)
+        elif action == "inclure":
+            self.exclues.difference_update(sel)
+        elif action == "suspectes":
+            self.exclues.update(self._ids_suspects(liste))
+        else:
+            self.exclues.clear()
+        self._maj_resultats(force=True)
+
+    def _dbl_clic(self, ev):
+        iid = self.tableau.identify_row(ev.y)
+        if iid:
+            self.exclues.symmetric_difference_update({int(iid)})
+            self._maj_resultats(force=True)
+
+    def _maj_resultats(self, force=False):
+        if self.moteur._gen != self._gen_vue:          # suivi réinitialisé : les numéros de piste ne signifient plus rien
+            self._gen_vue = self.moteur._gen
+            self.exclues.clear()
+            force = True
+        if self.moteur.resultats()[2] == self._version_res and not force:
             return
+        liste, gardees, final, version = self._resultats_utilisateur()
         self._version_res = version
         if final is None:
             self.var_rayon.set("—")
-            self.var_rayon_detail.set(f"En attente de trajectoires d'au moins {self.pa.n_min} images…"
-                                      if self.pa.actif else "Suivi désactivé.")
+            if liste:
+                self.var_rayon_detail.set("Aucune particule incluse : inclus-en au moins une dans le tableau.")
+            else:
+                self.var_rayon_detail.set(f"En attente de trajectoires d'au moins {self.pa.n_min} images…"
+                                          if self.pa.actif else "Suivi désactivé.")
         else:
             self.var_rayon.set(f"a = {final['a'] * 1e6:.3f} ± {final['inc'] * 1e6:.3f} µm")
             chi = "" if not np.isfinite(final["chi2_red"]) else f"  ·  χ²réd = {final['chi2_red']:.2f}"
             sp = final.get("sigma_psf_px")
-            self.var_rayon_detail.set(f"{final['n']} particule(s){chi}"
+            self.var_rayon_detail.set(f"{len(gardees)} particule(s) incluse(s) sur {len(liste)}{chi}"
                                       + (f"  ·  σ_PSF = {sp:.2f} px" if sp else "")
                                       + f"\nσ_PSF (localisation) = {final['inc_psf'] * 1e6:.3f} µm ⊕ σ_stat = {final['inc_stat'] * 1e6:.3f} µm")
+        suspects = self._ids_suspects(liste)
+        sel = set(self.tableau.selection())
         self.tableau.delete(*self.tableau.get_children())
         for r in liste:
-            self.tableau.insert("", "end", values=(r["piste"], r["n_pts"], f"{r['D'] * 1e12:.3f}", f"{r['sigma_exp'] * 1e9:.0f}",
-                                                   f"{r['a'] * 1e6:.3f}", f"{r['inc_psf'] * 1e6:.3f}",
-                                                   f"{r['inc_stat'] * 1e6:.3f}", f"{r['inc'] * 1e6:.3f}"))
+            excl, susp = r["piste"] in self.exclues, r["piste"] in suspects
+            tags = (["exclue"] if excl else []) + (["suspecte"] if susp and not excl else [])
+            self.tableau.insert("", "end", iid=str(r["piste"]), tags=tags, values=(
+                "✘" if excl else "✔", r["piste"], r["n_pts"], f"{r['D'] * 1e12:.3f}", f"{r['sigma_exp'] * 1e9:.0f}",
+                f"{r['a'] * 1e6:.3f}", f"{r['inc_psf'] * 1e6:.3f}", f"{r['inc_stat'] * 1e6:.3f}", f"{r['inc'] * 1e6:.3f}",
+                "suspecte" if susp else ""))
+        encore = [i for i in sel if self.tableau.exists(i)]
+        if encore:
+            self.tableau.selection_set(encore)
         self._fig_a_jour = False
         self._maj_figure()
 
@@ -1433,32 +1541,39 @@ class Application(ttk.Frame):
             self._dessiner_figure()
 
     def _dessiner_figure(self):
-        liste, final, _ = self.moteur.resultats()
+        liste, gardees, final, _ = self._resultats_utilisateur()
         c = self.moteur.cond
         dt, pe = 1.0 / c.fps, c.pixel_eff_m
         self.ax_msd.clear()
         self.ax_a.clear()
         for r in liste:
-            col = tuple(v / 255 for v in couleur_piste(r["piste"])[::-1])
+            excl = r["piste"] in self.exclues
+            col = "#9e9e9e" if excl else tuple(v / 255 for v in couleur_piste(r["piste"])[::-1])
             pos = r["pos_px"] * pe
             lags, msd = tp.msd_temporel(pos, self.pa.lag_max)
             ok = np.isfinite(msd)
-            self.ax_msd.plot(lags[ok] * dt, msd[ok] * 1e12, "o", color=col, ms=4)
+            self.ax_msd.plot(lags[ok] * dt, msd[ok] * 1e12, "o", color=col, ms=4, alpha=0.5 if excl else 1)
             D, off = tp.ajuste_msd(pos, dt, self.pa.lag_max)
             tt = np.linspace(0, lags[-1] * dt, 20)
-            self.ax_msd.plot(tt, (4 * D * tt + off) * 1e12, "-", color=col, lw=1, label=f"{r['piste']}")
+            self.ax_msd.plot(tt, (4 * D * tt + off) * 1e12, "--" if excl else "-", color=col, lw=1,
+                             label=f"{r['piste']}" + (" (exclue)" if excl else ""))
         self.ax_msd.set(xlabel="Délai τ (s)", ylabel="MSD (µm²)", title="MSD et ajustement linéaire (Éq. 7)")
         self.ax_msd.grid(alpha=0.3)
         if liste:
             self.ax_msd.legend(title="piste", fontsize=7, ncol=2)
             ids = [r["piste"] for r in liste]
-            a = np.array([r["a"] for r in liste]) * 1e6
-            self.ax_a.errorbar(range(len(ids)), a, yerr=[r["inc"] * 1e6 for r in liste], fmt="o", capsize=4, label="a ± σ_tot")
+            for i, r in enumerate(liste):
+                excl = r["piste"] in self.exclues
+                self.ax_a.errorbar([i], [r["a"] * 1e6], yerr=[r["inc"] * 1e6], fmt="x" if excl else "o", capsize=4,
+                                   color="#9e9e9e" if excl else "tab:blue",
+                                   label=("exclue" if excl else "a ± σ_tot") if i == next(
+                                       (k for k, q in enumerate(liste) if (q["piste"] in self.exclues) == excl), -1) else None)
             self.ax_a.set_xticks(range(len(ids)))
             self.ax_a.set_xticklabels(ids)
-            self.ax_a.axhline(final["a"] * 1e6, color="tab:green")
-            self.ax_a.axhspan((final["a"] - final["inc"]) * 1e6, (final["a"] + final["inc"]) * 1e6, color="tab:green", alpha=0.2,
-                              label=f"final = {final['a'] * 1e6:.3f} ± {final['inc'] * 1e6:.3f} µm")
+            if final is not None:
+                self.ax_a.axhline(final["a"] * 1e6, color="tab:green")
+                self.ax_a.axhspan((final["a"] - final["inc"]) * 1e6, (final["a"] + final["inc"]) * 1e6, color="tab:green", alpha=0.2,
+                                  label=f"final = {final['a'] * 1e6:.3f} ± {final['inc'] * 1e6:.3f} µm")
             self.ax_a.legend(fontsize=8)
         else:
             for ax in (self.ax_msd, self.ax_a):
@@ -1467,7 +1582,6 @@ class Application(ttk.Frame):
         self.ax_a.grid(alpha=0.3)
         self.canvas_fig.draw_idle()
         self._fig_a_jour = True
-
 
 def main():
     try:                                                  # rendu net sur écrans Windows à haute densité
