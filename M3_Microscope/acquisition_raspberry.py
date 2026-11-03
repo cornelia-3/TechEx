@@ -256,7 +256,7 @@ class Enregistreur:
         with open(self.base.with_suffix(".json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1, ensure_ascii=False)
 
-        print(f"\n=== Enregistrement terminé : {self.n} images -> {fichier.name}")
+        print(f"\n=== ENREGISTREMENT TERMINÉ : fichiers écrits -> {fichier.name}")
         print(f"    fps réel = {fps:.2f}   images perdues = {perdues}   écriture finale = {duree_ecriture:.1f} s")
         if perdues:
             print("    ATTENTION : images perdues. Essayer LIVE_PENDANT_ENREGISTREMENT = False, "
@@ -332,6 +332,10 @@ def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consign
                 rec.ajouter(img, md)
                 with etat.verrou:
                     etat.n_rec = rec.n
+                pas = max(1, rec.n_max // 10) if rec.n_max else 50
+                if rec.n % pas == 0:
+                    total = f"/{rec.n_max}" if rec.n_max else ""
+                    print(f"  ● capture : {rec.n}{total} images", flush=True)
                 if rec.plein():
                     rec = _arreter(rec, etat)
     finally:
@@ -343,6 +347,9 @@ def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consign
 def _arreter(rec, etat):
     with etat.verrou:
         etat.enregistre, etat.ecriture = False, True
+    duree = (rec.stamps[-1] - rec.stamps[0]) / 1e9 if len(rec.stamps) > 1 else 0.0
+    print(f"\n■ CAPTURE TERMINÉE : {rec.n} images en {duree:.1f} s. "
+          f"Le direct reste figé pendant l'écriture des fichiers.", flush=True)
     rec.terminer()
     with etat.verrou:
         etat.ecriture = False
