@@ -1,7 +1,7 @@
 """Traitement des acquisitions du microscope : rayon des billes par suivi de particules (MSD + Stokes-Einstein).
 
 Au lancement, deux choix dans le terminal :
-  1. le FICHIER, parmi ceux du dossier TechEx/gab (piles .tif de acquisition_raspberry.py,
+  1. le FICHIER, parmi ceux du dossier M3_Microscope/techex_M3_videos (piles .tif de acquisition_raspberry.py,
      dossiers de PNG de l'option E, ou anciennes vidéos .mp4);
   2. l'ANALYSE :
      1 = analyse « classique » : une image avec ses détections, puis trajectoires et rayon par particule;
@@ -15,16 +15,20 @@ Au lancement, deux choix dans le terminal :
 Exclusion À LA MAIN, une fois l'analyse faite (rien n'est exclu automatiquement) :
   - analyse 1 : après la figure, taper dans le terminal les numéros des pistes à exclure / réintégrer;
   - analyse 2 : cliquer sur une bille dans la vidéo, ou sur son point dans le graphique des rayons
-    (r = tout réintégrer). Le rayon moyen, la carte, le tableau et l'export se mettent à jour.
-Les billes immobiles (D <= 0) sont suivies, affichées (« immobile ») et comptées dans la moyenne tant
-qu'elles ne sont pas exclues. Leur rayon (a = ∞) ne se moyenne pas : dès qu'une immobile est sélectionnée,
-le rayon moyen est calculé à partir de la moyenne des D (a = kT / 6πη·D_moyen). Sans immobile sélectionnée,
-c'est la moyenne pondérée des rayons, comme avant.
+    ou sur sa ligne dans le tableau (r = tout réintégrer). Le rayon moyen, la carte, le tableau et l'export se mettent à jour.
+Toutes les pistes sont traitées de la même façon et toutes les valeurs du tableau sont calculées pour
+chacune (D, σ_exp, a, σ_PSF, σ_stat, σ_tot), même quand D <= 0 (a est alors négatif). Aucune piste n'est
+qualifiée ni écartée automatiquement : c'est l'utilisateur qui choisit. Rayon moyen des pistes sélectionnées :
+moyenne pondérée des rayons si toutes ont D > 0; sinon (un rayon négatif ne se moyenne pas) moyenne des D,
+puis a = kT / (6πη·D_moyen).
 
 Les paramètres d'acquisition sont lus dans le .json écrit à côté de chaque pile par acquisition_raspberry.py :
   - le temps de chaque image (horodatages du capteur) -> Δt réel, et les images perdues deviennent des trous
     dans les trajectoires au lieu de fausser le MSD;
-  - la taille de pixel (pixel_effectif_capteur_um / grossissement);
+  - la taille de pixel = pixel_effectif_capteur_um / grossissement RÉEL. Le grossissement réel est mesuré
+    sur une photo de règle du même objectif (regle<G>x….png, dans le dossier des acquisitions) par la
+    méthode de grossissement_regle.py; résultat et figure mis en cache (<photo>_etalonnage.json / .png).
+    Sans photo, on garde le grossissement nominal du .json. Comme a ∝ (pixel)², c'est crucial;
   - le contenu : une mosaïque de Bayer brute (options D, E) est d'abord sommée 2x2 pour donner une image grise.
 Les données restent en 16 bits (aucune conversion en 8 bits, sauf pour l'affichage).
 Sans .json (mp4, TIFF externe), on retombe sur les constantes ci-dessous, avec un avertissement.
@@ -33,6 +37,7 @@ import csv
 import json
 import math
 import re
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -44,8 +49,10 @@ from matplotlib.animation import FuncAnimation
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage as ndi
 from scipy.optimize import curve_fit, linear_sum_assignment
+from scipy.signal import find_peaks
+from scipy.special import erf
 
-DOSSIER_DONNEES = Path(__file__).resolve().parent.parent / "gab"   # TechEx/gab
+DOSSIER_DONNEES = Path(__file__).resolve().parent / "techex_M3_videos"   # TechEx/M3_Microscope/techex_M3_videos
 # pour dense_up.mp4, on ne détecte aucune particule
 # pour gab.mp4, on ne détecte aucune particule
 # pour 20X on détecte bien les 6 particules : a = 1.257 µm  ± 0.088 µm (σ_PSF = 0.008 ⊕ σ_stat = 0.088), 6 particules, χ²_red = 1.76
@@ -72,10 +79,277 @@ DEMI_REGION_UM = 3.9       # demi-largeur de la région utilisée pour la 1re es
 SEUIL_K = 5.0              # seuil de détection = fond + k * bruit
 TROU_MAX = 5               # nb d'images manquantes tolérées dans une trajectoire (images perdues comprises)
 N_MIN = 20                 # nb minimal de positions pour garder une trajectoire
-LAG_MAX = 3                # nb de décalages utilisés dans l'ajustement du MSD
+# Indication « immobile ? » (colonne du tableau de l'analyse 2; n'exclut RIEN, c'est une information) :
+SEUIL_IMMOBILE_SIGMA = 2.0     # immobile si D < SEUIL × σ_D0 (σ_D0 : dispersion de D d'une bille parfaitement immobile)
+A_MAX_IMMOBILE_UM = 5.0        # ... ou si a > 5 µm : plus gros que les particules du mandat (10 µm de diamètre au plus)
+N_SIMULATIONS_IMMOBILE = 300   # tirages pour estimer σ_D0
+LAG_MAX = 3                # nb de décalages L utilisés dans l'ajustement du MSD (valeur proposée au lancement)
 
 EXTENSIONS_TIFF = {".tif", ".tiff"}
 EXTENSIONS_VIDEO = {".mp4", ".avi", ".h264", ".mov"}
+
+
+#############################################################################################################
+#                       ÉTALONNAGE DU GROSSISSEMENT AVEC UNE RÈGLE (repris de grossissement_regle.py)
+#   Principe : on mesure le pas p (pixels) entre les graduations d'une photo de règle prise avec le même
+#   objectif. Pixel dans le plan objet = PAS_GRADUATION / p ; grossissement réel M = pixel capteur / pixel objet.
+#   Le résultat est mis en cache à côté de la photo (<photo>_etalonnage.json) avec sa figure
+#   (<photo>_etalonnage.png) : l'étalonnage (≈ 20 s) n'est refait que si la photo ou le pas changent.
+#############################################################################################################
+
+ETALONNER = True              # False = grossissement nominal du .json, sans règle
+PAS_GRADUATION = 100e-6       # m entre deux graduations consécutives de la règle  <-- À CONFIRMER
+F_TUBE = 150e-3               # m, focale de la lentille de tube (sert seulement à l'affichage)
+EXTENSIONS_REGLE = {".png", ".tif", ".tiff", ".jpg"}
+VERSION_ETALONNAGE = 2        # à incrémenter si la méthode change : les caches existants sont alors refaits
+
+
+def charger_image_regle(chemin):
+    """Photo de la règle en niveaux de gris (float), profondeur du fichier conservée."""
+    img = cv2.imread(str(chemin), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Impossible d'ouvrir l'image : {chemin}")
+    if img.ndim == 3:
+        img = cv2.cvtColor(img[..., :3], cv2.COLOR_BGR2GRAY)
+    return img.astype(float)
+
+
+def angles_candidats(img, reduction=4, demi_plage_deg=4.0, pas_deg=0.1):
+    """Normales des deux familles de traits d'une règle quadrillée (≈ 0° : traits verticaux, ≈ 90° : traits
+    horizontaux), en radians. Chacune est affinée (±4°) en maximisant la netteté du profil sur l'image réduite.
+    (Le tenseur de structure de grossissement_regle.py donne ≈ 45° quand les deux familles pèsent autant,
+    ce qui arrive au 40X où l'on ne voit que 2 traits verticaux et 1 horizontal.)"""
+    petit = cv2.resize(img, None, fx=1 / reduction, fy=1 / reduction, interpolation=cv2.INTER_AREA)
+    angles = []
+    for base in (0.0, 90.0):
+        meilleur = (-np.inf, np.radians(base))
+        for d in np.arange(-demi_plage_deg, demi_plage_deg + pas_deg / 2, pas_deg):
+            th = np.radians(base + d)
+            _, pr = profil_normal(petit, th)
+            nettete = np.mean(np.diff(ndi.gaussian_filter1d(pr, 1.0))**2)
+            if nettete > meilleur[0]:
+                meilleur = (nettete, th)
+        angles.append(meilleur[1])
+    return angles
+
+
+def profil_normal(img, theta, marge=0.03):
+    """Intensité moyenne en fonction de la distance s (pixels) mesurée perpendiculairement aux traits."""
+    h, w = img.shape
+    y0, y1 = int(h * marge), int(h * (1 - marge))
+    x0, x1 = int(w * marge), int(w * (1 - marge))
+    Y, X = np.mgrid[y0:y1, x0:x1]
+    s = X * np.cos(theta) + Y * np.sin(theta)
+    s0 = s.min()
+    cases = np.round(s - s0).astype(int).ravel()
+    somme = np.bincount(cases, weights=img[y0:y1, x0:x1].ravel())
+    n = np.bincount(cases)
+    ok = n >= 0.5 * n.max()                      # écarte les bords peu peuplés
+    positions = np.arange(len(n)) + s0
+    profil = np.where(n > 0, somme / np.maximum(n, 1), 0.0)
+    return positions[ok], profil[ok]
+
+
+def _gauss1d(x, A, x0, sigma, b):
+    return A * np.exp(-(x - x0)**2 / (2 * sigma**2)) + b
+
+
+def _creneau(x, A, x0, w, sig, b):
+    """Trait de largeur w (plateau) aux bords adoucis par un flou gaussien sig."""
+    r2 = np.sqrt(2) * sig
+    return b + 0.5 * A * (erf((x - x0 + w / 2) / r2) - erf((x - x0 - w / 2) / r2))
+
+
+def _ajuster_trait(s, signal, i, periode_attendue):
+    """Position sub-pixel du trait dont le maximum approximatif est à l'indice i.
+    Modèle principal : créneau flouté (traits larges à fond plat). Repli : gaussienne (traits fins)."""
+    A_est = signal[i]
+    g, d = i, i
+    while g > 0 and signal[g - 1] > 0.5 * A_est:
+        g -= 1
+    while d < len(s) - 1 and signal[d + 1] > 0.5 * A_est:
+        d += 1
+    w0 = max(s[d] - s[g], 3.0)
+    x00 = 0.5 * (s[g] + s[d])
+    demi = int(min(w0 + 30, 0.45 * periode_attendue))
+    lo, hi = max(np.searchsorted(s, x00 - demi), 0), min(np.searchsorted(s, x00 + demi), len(s))
+    if hi - lo < 9:
+        return None
+    xs, ys = s[lo:hi], signal[lo:hi]
+    try:
+        p, cov = curve_fit(_creneau, xs, ys, p0=[A_est, x00, w0, 2.0, np.median(ys)],
+                           bounds=([0, x00 - w0, 0.5, 0.3, -np.inf],
+                                   [np.inf, x00 + w0, 2 * w0 + 10, w0 + 10, np.inf]))
+        err = np.sqrt(cov[1, 1])
+        if np.isfinite(err) and err < w0:
+            return p[1], err
+    except (RuntimeError, ValueError):
+        pass
+    try:
+        p, cov = curve_fit(_gauss1d, xs, ys, p0=[A_est, x00, max(w0 / 2.355, 1.0), np.median(ys)],
+                           bounds=([0, xs[0], 0.3, -np.inf], [np.inf, xs[-1], 2 * demi, np.inf]))
+    except (RuntimeError, ValueError):
+        return None
+    err = np.sqrt(cov[1, 1])
+    return (p[1], err) if np.isfinite(err) else None
+
+
+def detecter_traits(s, profil, periode_attendue):
+    """Position sub-pixel (pixels, le long de la normale) de chaque trait."""
+    fenetre = min(int(0.6 * periode_attendue), len(profil) - 1) | 1     # > largeur d'un trait, < pas
+    fond = ndi.median_filter(profil, size=fenetre, mode="nearest")
+    brut = profil - fond
+
+    def amplitude(sig):                          # polarité : l'écart le plus ample (creux ou bosses)
+        return ndi.gaussian_filter1d(sig, 2).max() - np.median(sig)
+    signal = brut if amplitude(brut) >= amplitude(-brut) else -brut
+    bruit = 1.4826 * np.median(np.abs(signal - np.median(signal)))
+    pics, _ = find_peaks(ndi.gaussian_filter1d(signal, 2), distance=max(1, int(0.5 * periode_attendue)),
+                         prominence=max(0.25 * amplitude(signal), 5 * bruit))
+    positions, erreurs = [], []
+    for i in pics:
+        r = _ajuster_trait(s, signal, i, periode_attendue)
+        if r is not None:
+            positions.append(r[0])
+            erreurs.append(r[1])
+    return np.array(positions), np.array(erreurs), signal
+
+
+def pas_en_pixels(positions, erreurs, periode_attendue):
+    """Régression position = x0 + p·n sur l'indice entier n de chaque trait (traits manquants tolérés).
+    Incertitude : la plus grande entre celle des résidus et celle des ajustements de chaque trait.
+    Avec 2 traits seulement : p = écart / n (n = nombre de pas entre eux, estimé avec le pas attendu),
+    incertitude = celles des 2 ajustements combinées (aucun résidu possible)."""
+    ordre = np.argsort(positions)
+    positions, erreurs = positions[ordre], erreurs[ordre]
+    if len(positions) == 2:
+        ecart = positions[1] - positions[0]
+        k = max(1, int(round(ecart / periode_attendue)))
+        p = ecart / k
+        return p, np.hypot(*erreurs) / k, np.array([0, k]), np.zeros(2), positions, erreurs
+    pas_approx = np.median(np.diff(positions))
+    n = np.round((positions - positions[0]) / pas_approx).astype(int)
+    (p, x0), cov = np.polyfit(n, positions, 1, cov=True)
+    _, cov_f = np.polyfit(n, positions, 1, w=1 / erreurs, cov="unscaled")
+    inc_p = max(np.sqrt(cov[0, 0]), np.sqrt(cov_f[0, 0]))
+    return p, inc_p, n, positions - (p * n + x0), positions, erreurs
+
+
+def etalonner_regle(chemin, M_nominal):
+    """Grossissement réel à partir de la photo de règle `chemin`. Retourne un dict (M, inc_M, pixel_eff
+    de la photo, pas en pixels...) et les données de la figure."""
+    img = charger_image_regle(chemin)
+    h, w = img.shape
+    pixel_capteur = TAILLE_PIXEL * 4056 / w          # taille d'un pixel de CETTE photo sur le capteur
+    periode_attendue = PAS_GRADUATION / (pixel_capteur / M_nominal)
+    if periode_attendue < 6:
+        raise ValueError("pas attendu < 6 pixels : vérifier PAS_GRADUATION et le grossissement nominal")
+    # Les deux familles de traits de la grille : on garde celle qui montre le plus de traits
+    meilleur = None
+    for theta in angles_candidats(img):
+        s, profil = profil_normal(img, theta)
+        positions, erreurs, signal = detecter_traits(s, profil, periode_attendue)
+        if meilleur is None or len(positions) > len(meilleur[3]):
+            meilleur = (theta, s, signal, positions, erreurs)
+    theta, s, signal, positions, erreurs = meilleur
+    if len(positions) < 2:
+        raise RuntimeError(f"seulement {len(positions)} trait(s) détecté(s) sur la règle (il en faut 2)")
+    p, inc_p, n, residus, positions, erreurs = pas_en_pixels(positions, erreurs, periode_attendue)
+    pixel_eff = PAS_GRADUATION / p
+    M = pixel_capteur / pixel_eff
+    res = dict(photo=Path(chemin).name, M_nominal=M_nominal, M=M, inc_M=M * inc_p / p,
+               pixel_eff_photo_um=pixel_eff * 1e6, inc_pixel_eff_photo_um=pixel_eff * inc_p / p * 1e6,
+               pas_px=p, inc_pas_px=inc_p, n_traits=len(positions), theta_deg=float(np.degrees(theta)),
+               pas_graduation_um=PAS_GRADUATION * 1e6, largeur_photo_px=w,
+               date=datetime.now().isoformat(timespec="seconds"))
+    figure = dict(img=img, theta=theta, s=s, signal=signal, positions=positions, erreurs=erreurs, n=n,
+                  residus=residus)
+    return res, figure
+
+
+def figure_etalonnage(res, fig_data, chemin_png):
+    """Photo de la règle avec les traits détectés, profil perpendiculaire, résidus de la régression."""
+    img, th = fig_data["img"], fig_data["theta"]
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5), gridspec_kw={"width_ratios": [1.3, 1.2, 0.8]})
+    bas, haut = np.percentile(img[::4, ::4], (1, 99.5))
+    ax[0].imshow(img, cmap="gray", vmin=bas, vmax=haut)
+    h, w = img.shape
+    for pos in fig_data["positions"]:                  # trait : x cosθ + y sinθ = pos
+        if abs(np.cos(th)) > abs(np.sin(th)):
+            y = np.array([0, h - 1])
+            x = (pos - y * np.sin(th)) / np.cos(th)
+        else:
+            x = np.array([0, w - 1])
+            y = (pos - x * np.cos(th)) / np.sin(th)
+        ax[0].plot(x, y, "r-", lw=1)
+    ax[0].set(xlim=(0, w), ylim=(h, 0), title=f"{res['photo']} : {res['n_traits']} traits détectés",
+              xlabel="x (pixels)", ylabel="y (pixels)")
+    ax[1].plot(fig_data["s"], fig_data["signal"], lw=0.8)
+    ax[1].plot(fig_data["positions"], np.interp(fig_data["positions"], fig_data["s"], fig_data["signal"]), "rv",
+               label="traits détectés")
+    ax[1].set(xlabel="position le long de la normale aux traits (pixels)", ylabel="signal (sans fond)",
+              title=f"Profil · pas = {res['pas_px']:.2f} ± {res['inc_pas_px']:.2f} px")
+    ax[1].legend()
+    ax[2].errorbar(fig_data["n"], fig_data["residus"], yerr=fig_data["erreurs"], fmt="o", capsize=3)
+    ax[2].axhline(0, color="k", lw=0.8)
+    ax[2].set(xlabel="indice du trait", ylabel="résidu (pixels)",
+              title="Résidus de la régression" if res["n_traits"] > 2
+              else "2 traits : pas de résidu\n(barres = incertitude de position de chaque trait)")
+    fig.suptitle(f"Étalonnage du grossissement — M = {res['M']:.3f} ± {res['inc_M']:.3f} (nominal "
+                 f"{res['M_nominal']}X) · pixel objet (photo pleine résolution) = "
+                 f"{res['pixel_eff_photo_um']:.5f} µm · graduation = {res['pas_graduation_um']:g} µm · "
+                 f"objectif équivalent f = {F_TUBE / res['M'] * 1e3:.2f} mm (tube {F_TUBE * 1e3:.0f} mm)",
+                 fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(chemin_png, dpi=110)
+    plt.close(fig)
+
+
+def trouver_regle(grossissement, dossiers):
+    """Photo de règle pour ce grossissement : nom commençant par « regle<G>x » (ex. regle20x_100mm.png)."""
+    motif = re.compile(rf"^r[eè]gle0*{int(round(float(grossissement)))}x", re.IGNORECASE)
+    for d in dossiers:
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.suffix.lower() in EXTENSIONS_REGLE and motif.match(p.stem) and "_etalonnage" not in p.stem:
+                    return p
+    return None
+
+
+def grossissement_reel(grossissement, dossiers):
+    """(M, inc_M, texte_source). Lit le cache <photo>_etalonnage.json s'il correspond à la photo et au pas
+    de graduation actuels; sinon refait l'étalonnage et écrit le cache et la figure. Sans photo (ou si
+    l'étalonnage échoue) : grossissement nominal."""
+    if not ETALONNER:
+        return float(grossissement), 0.0, "nominal (ETALONNER = False)"
+    photo = trouver_regle(grossissement, dossiers)
+    if photo is None:
+        return float(grossissement), 0.0, f"nominal (aucune photo regle{grossissement}x… trouvée)"
+    cache = photo.with_name(photo.stem + "_etalonnage.json")
+    signature = dict(taille_octets=photo.stat().st_size, mtime=photo.stat().st_mtime,
+                     pas_graduation_um=PAS_GRADUATION * 1e6, M_nominal=float(grossissement),
+                     version_methode=VERSION_ETALONNAGE)
+    try:
+        res = json.loads(cache.read_text(encoding="utf-8"))
+        if res.get("signature") == signature:
+            return res["M"], res["inc_M"], f"étalonné ({photo.name}, cache)"
+    except (OSError, ValueError):
+        pass
+    print(f"Étalonnage du grossissement sur {photo.name} (≈ 20 s, une seule fois)...", flush=True)
+    try:
+        res, fig_data = etalonner_regle(photo, float(grossissement))
+    except (RuntimeError, ValueError) as ex:
+        print(f"  ÉCHEC : {ex}. On garde le grossissement nominal {grossissement}X.")
+        return float(grossissement), 0.0, f"nominal (étalonnage impossible sur {photo.name})"
+    res["signature"] = signature
+    try:
+        cache.write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
+        figure_etalonnage(res, fig_data, photo.with_name(photo.stem + "_etalonnage.png"))
+        print(f"  M = {res['M']:.3f} ± {res['inc_M']:.3f} (nominal {grossissement}X) · figure : "
+              f"{photo.stem}_etalonnage.png")
+    except OSError as ex:
+        print(f"  (cache non écrit : {ex})")
+    return res["M"], res["inc_M"], f"étalonné ({photo.name})"
 
 
 #############################################################################################################
@@ -134,7 +408,25 @@ def _lire_dossier(chemin):
     return np.stack([lire(p) for p in fichiers])
 
 
-def charger_acquisition(chemin):
+# Pixel effectif au capteur (µm) et durée d'image (µs) de chaque option de acquisition_raspberry.py :
+# servent quand le .json manque (la lettre et le grossissement sont alors lus dans le nom du fichier).
+PIXEL_CAPTEUR_OPTION_UM = {"A": 3.1, "B": 3.1, "C": 6.2, "D": 1.55, "E": 1.55}
+DUREE_IMAGE_OPTION_US = {"A": 100_000, "B": 100_000, "C": 92_000, "D": 100_000, "E": 100_000}
+
+
+def infos_depuis_nom(chemin):
+    """(option, grossissement) lus dans un nom du type …_C_40X.tif ; None si absent."""
+    m = re.search(r"_([A-E])_([\d.]+)X", Path(chemin).name)
+    return (m.group(1), float(m.group(2))) if m else (None, None)
+
+
+def fps_par_defaut(chemin):
+    """fps de l'acquisition déduit de l'option (exposition de 90 ms du script d'acquisition)."""
+    option, _ = infos_depuis_nom(chemin)
+    return 1e6 / DUREE_IMAGE_OPTION_US[option] if option else FPS_DEFAUT
+
+
+def charger_acquisition(chemin, fps_sans_json=None):
     """Charge une acquisition et ses paramètres. Retourne un dict :
     frames (n,h,w) · temps_s (n,) · indices (n,) numéro de créneau de chaque image (trous = images perdues)
     · dt (s) · pixel_eff (m/px) · meta (contenu du .json ou {}) · source (texte)."""
@@ -151,17 +443,31 @@ def charger_acquisition(chemin):
     else:
         frames, fps_fichier = charger_video(chemin)
 
+    # Sans .json : option et grossissement tirés du nom du fichier (…_C_40X.tif)
+    option_nom, G_nom = infos_depuis_nom(chemin)
+    option = meta.get("option") or option_nom
+
     # Mosaïque de Bayer brute (options D et E) -> somme 2x2 en gris, pixel 2x plus grand
-    bayer = "bayer" in meta.get("contenu", "").lower() and "somme" not in meta.get("contenu", "").lower()
+    if meta:
+        bayer = "bayer" in meta.get("contenu", "").lower() and "somme" not in meta.get("contenu", "").lower()
+    else:
+        bayer = option in ("D", "E")
     if bayer:
         frames = np.stack([somme_bayer(f) for f in frames])
 
-    # Taille de pixel dans le plan objet
-    if meta.get("pixel_effectif_capteur_um") and meta.get("grossissement"):
-        pixel_eff = meta["pixel_effectif_capteur_um"] * (2 if bayer else 1) / float(meta["grossissement"]) * 1e-6
+    # Taille de pixel dans le plan objet = pixel effectif au capteur / grossissement RÉEL (étalonné sur la règle)
+    G_nominal = meta.get("grossissement") or (int(G_nom) if G_nom and G_nom.is_integer() else G_nom) or GROSSISSEMENT
+    M, inc_M, source_M = grossissement_reel(G_nominal, [chemin.parent, DOSSIER_DONNEES])
+    if meta.get("pixel_effectif_capteur_um"):
+        pixel_capteur_um = meta["pixel_effectif_capteur_um"] * (2 if bayer else 1)
         source_pixel = "json"
+    elif option in PIXEL_CAPTEUR_OPTION_UM:
+        pixel_capteur_um = PIXEL_CAPTEUR_OPTION_UM[option] * (2 if bayer else 1)
+        source_pixel = f"option {option} lue dans le nom du fichier"
     else:
-        pixel_eff, source_pixel = PIXEL_EFF, "constantes du script"
+        pixel_capteur_um = TAILLE_PIXEL * REDUCTION * 1e6
+        source_pixel = "constantes du script"
+    pixel_eff = pixel_capteur_um / M * 1e-6
 
     # Temps de chaque image : horodatages du capteur, sinon fps
     stamps = meta.get("timestamps_ns")
@@ -172,14 +478,20 @@ def charger_acquisition(chemin):
         dt = float(np.median(np.diff(t))) if len(t) > 1 else 1 / FPS_DEFAUT
         source_temps = "horodatages du json"
     else:
-        fps = fps_fichier if fps_fichier and fps_fichier > 0 else FPS_DEFAUT
+        if fps_fichier and fps_fichier > 0:
+            fps, origine = fps_fichier, "fichier vidéo"
+        elif fps_sans_json:
+            fps, origine = fps_sans_json, "saisi au lancement, pas d'horodatages"
+        else:
+            fps, origine = FPS_DEFAUT, "valeur par défaut"
         dt = 1 / fps
         t = np.arange(len(frames)) * dt
-        source_temps = f"fps = {fps:g} ({'fichier vidéo' if fps_fichier else 'valeur par défaut'})"
+        source_temps = f"fps = {fps:g} ({origine})"
     indices = np.round(t / dt).astype(int)
 
     return dict(frames=frames, temps_s=t, indices=indices, dt=dt, pixel_eff=pixel_eff, meta=meta,
-                bayer=bayer, source=f"pixel : {source_pixel} · temps : {source_temps}")
+                bayer=bayer, option=option, grossissement_nominal=G_nominal, grossissement_reel=M, inc_M=inc_M,
+                source=f"pixel capteur : {source_pixel} · grossissement : {source_M} · temps : {source_temps}")
 
 
 def parametres_pixels(pixel_eff):
@@ -325,9 +637,14 @@ def msd_temporel(pos, lag_max):
 
 
 def ajuste_msd(pos, dt, lag_max):
-    """MSD = 2N D t + 2N σ_exp² (Éq. 7). Retourne D (m²/s) et l'offset (m²)."""
+    """MSD = 2N D t + 2N σ_exp² (Éq. 7). Retourne D (m²/s) et l'offset (m²).
+    Avec un seul décalage (L = 1), une droite à 2 paramètres n'est pas définie : D = MSD(Δt) / (2N Δt),
+    c.-à-d. une droite forcée par l'origine (σ_exp non estimé, offset = NaN)."""
     lags, msd = msd_temporel(pos, lag_max)
     ok = np.isfinite(msd)
+    if ok.sum() == 1:
+        k = lags[ok][0]
+        return msd[ok][0] / (k * dt) / (2 * pos.shape[1]), np.nan
     if ok.sum() < 2:
         return np.nan, np.nan
     pente, offset = np.polyfit(lags[ok] * dt, msd[ok], 1)
@@ -396,7 +713,9 @@ def _paires_valides(pos, lag_max):
 
 
 def _coeffs_regression(ks, dt):
-    """Pente de la régression linéaire = Σ c_k · MSD_k."""
+    """Pente de la régression linéaire = Σ c_k · MSD_k (un seul décalage : pente = MSD_k / t_k)."""
+    if len(ks) == 1:
+        return np.array([1.0 / (ks[0] * dt)])
     t = ks * dt
     return (t - t.mean()) / np.sum((t - t.mean())**2)
 
@@ -498,53 +817,87 @@ def pistes_en_tableaux(pistes, n_min=20):
     return sorties
 
 
+def rayon_piste_complet(pos_px, inc_px, dt, pixel_eff=PIXEL_EFF, lag_max=3):
+    """Comme rayon_piste, mais calcule TOUT pour toutes les pistes, y compris D <= 0 :
+    a = kT / (6πηD) (négatif si D < 0, infini si D = 0), incertitudes propagées par δa = |a|·δD/|D|.
+    σ_stat utilise |D| comme variance d'un pas (une variance ne peut pas être négative)."""
+    pos, inc = pos_px * pixel_eff, inc_px * pixel_eff
+    n_dim = pos.shape[1]
+    D, offset = ajuste_msd(pos, dt, lag_max)
+    nan = dict(a=np.nan, D=D, sigma_exp=np.nan, inc_psf=np.nan, inc_stat=np.nan, inc=np.nan)
+    if not np.isfinite(D):
+        return nan
+    sigma_exp = np.sqrt(max(offset, 0) / (2 * n_dim))
+    if D == 0:
+        return {**nan, "a": np.inf, "sigma_exp": sigma_exp}
+    a = kB * T / (6 * np.pi * ETA * D)
+    inc_psf = abs(a) * incertitude_D_psf(pos, inc, dt, lag_max) / abs(D)
+    inc_stat = abs(a) * incertitude_D_stat(pos, abs(D), dt, lag_max) / abs(D)
+    return dict(a=a, D=D, sigma_exp=sigma_exp, inc_psf=inc_psf, inc_stat=inc_stat, inc=np.hypot(inc_psf, inc_stat))
+
+
 def analyser_pistes(pistes_tab, dt, **kw):
-    """Une entrée par piste d'au moins N_MIN positions. AUCUNE piste n'est écartée automatiquement :
-    une bille immobile (MSD qui ne croît pas, D <= 0) est gardée et affichée avec la mention « immobile »;
-    son rayon n'est pas défini (a = ∞) : si elle est sélectionnée, rayon_final passe par la moyenne des D.
-    Les exclusions se font ensuite À LA MAIN (choisir_exclusions, ou clic dans l'analyse 2)."""
+    """Une entrée par piste d'au moins N_MIN positions, toutes les valeurs calculées pour chacune.
+    Aucune piste n'est qualifiée ni écartée automatiquement : les exclusions se font À LA MAIN
+    (choisir_exclusions, ou clic dans l'analyse 2)."""
     resultats = []
+    rng = np.random.default_rng(0)                   # graine fixe : la colonne « immobile ? » est reproductible
     for num, p in enumerate(pistes_tab):
-        r = rayon_piste(p["pos_px"], p["inc_px"], dt, **kw)
-        if r is None:
-            pos = p["pos_px"] * kw.get("pixel_eff", PIXEL_EFF)
-            D, offset = ajuste_msd(pos, dt, kw.get("lag_max", 3))
-            sig = np.sqrt(offset / 4) if np.isfinite(offset) and offset > 0 else np.nan
-            r = dict(a=np.inf, D=D, sigma_exp=sig, inc_psf=np.nan, inc_stat=np.nan, inc=np.nan, immobile=True)
-        else:
-            r["immobile"] = False
+        r = rayon_piste_complet(p["pos_px"], p["inc_px"], dt, **kw)
         r.update(piste=num, f0=p["f0"], pos_px=p["pos_px"], sig_px=p["sig_px"],
                  n_pts=int(np.isfinite(p["pos_px"][:, 0]).sum()))
+        r.update(test_immobile(r, p, dt, kw.get("pixel_eff", PIXEL_EFF), kw.get("lag_max", 3), rng))
         resultats.append(r)
     return resultats
 
 
+def test_immobile(r, piste, dt, pixel_eff, lag_max, rng):
+    """Critère « immobile ? » (indicatif seulement). Une bille est jugée immobile si :
+      1) son D n'est pas significativement plus grand que celui qu'on mesurerait sur une bille parfaitement
+         immobile : D < SEUIL_IMMOBILE_SIGMA · σ_D0, où σ_D0 est la dispersion de D obtenue en simulant
+         N_SIMULATIONS_IMMOBILE fois une bille fixe avec la MÊME erreur de localisation (σ_exp de la piste),
+         les mêmes images manquantes et le même ajustement du MSD (L décalages). D <= 0 tombe dans ce cas;
+      2) ou si son rayon dépasse A_MAX_IMMOBILE_UM (5 µm) : aucune particule du mandat (10 µm de diamètre au plus)
+         ne peut diffuser aussi lentement; une bille plus lente est collée ou freinée par la paroi."""
+    pos = piste["pos_px"] * pixel_eff
+    ok = np.isfinite(pos[:, 0])
+    sig = r["sigma_exp"]
+    if not (np.isfinite(sig) and sig > 0):                    # L = 1, ou offset négatif : erreur des ajustements
+        sig = np.nanmedian(piste["inc_px"]) * pixel_eff
+    D_sim = [ajuste_msd(np.where(ok[:, None], rng.normal(0, sig, pos.shape), np.nan), dt, lag_max)[0]
+             for _ in range(N_SIMULATIONS_IMMOBILE)]
+    s0 = float(np.nanstd(D_sim))
+    if not np.isfinite(r["D"]) or r["D"] < SEUIL_IMMOBILE_SIGMA * s0:
+        raison = "oui (D ≤ 0)" if not r["D"] > 0 else f"oui (D < {SEUIL_IMMOBILE_SIGMA:g}σ₀)"
+        return dict(immobile=True, raison_immobile=raison, sigma_D0=s0)
+    if np.isfinite(r["a"]) and r["a"] * 1e6 > A_MAX_IMMOBILE_UM:
+        return dict(immobile=True, raison_immobile=f"oui (a > {A_MAX_IMMOBILE_UM:g} µm)", sigma_D0=s0)
+    return dict(immobile=False, raison_immobile="non", sigma_D0=s0)
+
+
 def statut(r, exclues=()):
-    if r["piste"] in exclues:
-        return "exclue"
-    return "immobile" if r["immobile"] else "mesurée"
+    return "exclue" if r["piste"] in exclues else "sélectionnée"
 
 
 def pistes_moyenne(resultats, exclues=()):
-    """Pistes qui entrent dans le rayon moyen : toutes celles qui ne sont pas exclues à la main,
-    immobiles comprises."""
+    """Pistes qui entrent dans le rayon moyen : toutes celles qui ne sont pas exclues à la main."""
     return [r for r in resultats if statut(r, exclues) != "exclue"]
 
 
 def rayon_final(resultats):
     """Rayon moyen des pistes données. None s'il n'y en a aucune.
 
-    Sans piste immobile : moyenne pondérée des rayons, poids = 1/(incertitude RELATIVE)² (pondérer par 1/σ²
+    Si toutes les pistes ont D > 0 : moyenne pondérée des rayons, poids = 1/(incertitude RELATIVE)² (pondérer par 1/σ²
     biaiserait vers les petits rayons, car σ est proportionnelle à a). σ_PSF et σ_stat sont propagées
     séparément puis sommées en quadrature.
 
-    Avec au moins une piste immobile (D <= 0, donc a = ∞, qui ne se moyenne pas) : on moyenne les
+    Si au moins une piste a D <= 0 (rayon négatif ou infini, qui ne se moyenne pas) : on moyenne les
     coefficients de diffusion D de toutes les pistes, puis a = kT / (6πη D_moyen) (Stokes-Einstein).
     Incertitude : dispersion des D (écart-type / √n), propagée par δa/a = δD/D. Si D_moyen <= 0, a = ∞."""
     resultats = list(resultats)
     if not resultats:
         return None
-    if any(r["immobile"] for r in resultats if "immobile" in r):
+    if any(not r["D"] > 0 for r in resultats):
         D = np.array([r["D"] for r in resultats], dtype=float)
         n = len(D)
         D_moy = D.mean()
@@ -554,8 +907,7 @@ def rayon_final(resultats):
             inc = a * inc_D / D_moy
         else:
             a, inc = np.inf, np.nan
-        return dict(a=a, inc_psf=np.nan, inc_stat=inc, inc=inc, chi2_red=np.nan, n=n, D_moy=D_moy,
-                    n_immobiles=sum(r["immobile"] for r in resultats), methode="D")
+        return dict(a=a, inc_psf=np.nan, inc_stat=inc, inc=inc, chi2_red=np.nan, n=n, D_moy=D_moy, methode="D")
     resultats = [r for r in resultats if np.isfinite(r["a"]) and np.isfinite(r["inc"]) and r["inc"] > 0]
     if not resultats:
         return None
@@ -585,8 +937,8 @@ def texte_final(final):
     if final is None:
         return "Rayon final : aucune piste dans la moyenne."
     if final.get("methode") == "D":
-        return (f"Rayon final : {texte_rayon(final)}  (moyenne des D sur {final['n']} pistes, dont "
-                f"{final['n_immobiles']} immobile(s) : D moyen = {final['D_moy'] * 1e12:.4f} µm²/s)")
+        return (f"Rayon final : {texte_rayon(final)}  (moyenne des D sur {final['n']} pistes : "
+                f"D moyen = {final['D_moy'] * 1e12:.4f} µm²/s, puis Stokes-Einstein)")
     return (f"Rayon final : {final['a']*1e6:.3f} µm  ± {final['inc']*1e6:.3f} µm "
             f"(σ_PSF = {final['inc_psf']*1e6:.3f} ⊕ σ_stat = {final['inc_stat']*1e6:.3f}), "
             f"{final['n']} particules, χ²_red = {final['chi2_red']:.2f}")
@@ -625,8 +977,7 @@ def choisir_exclusions(resultats, exclues=None):
 
 
 def tracer_rayons(ax, resultats, final, exclues=()):
-    """Rayon par piste : en couleur les pistes de la moyenne, en gris (×) les pistes exclues à la main.
-    Les pistes immobiles (a = ∞) ne peuvent pas être placées sur l'axe : elles sont nommées dans le titre."""
+    """Rayon par piste (toutes, y compris a < 0) : en couleur les pistes sélectionnées, en gris (×) les exclues."""
     finis = [r for r in resultats if np.isfinite(r["a"])]
     for r in finis:
         exclue = r["piste"] in exclues
@@ -639,11 +990,11 @@ def tracer_rayons(ax, resultats, final, exclues=()):
                    + (" (moyenne des D)" if final.get("methode") == "D" else ""))
         ax.legend()
     a = np.array([r["a"] for r in finis])
-    if len(a) and a.max() / a.min() > 20:                    # une bille quasi immobile écrase l'échelle
+    if len(a) and a.min() > 0 and a.max() / a.min() > 20:   # grand écart (tous positifs) : échelle log
         ax.set_yscale("log")
-    immobiles = [r["piste"] for r in resultats if r["immobile"]]
-    ax.set(xlabel="piste", ylabel="rayon (µm)",
-           title="Rayon par particule (× gris = exclue)" + (f"\nimmobiles (a = ∞) : {immobiles}" if immobiles else ""))
+    elif len(a) and a.min() < 0:
+        ax.axhline(0, color="k", lw=0.6)
+    ax.set(xlabel="piste", ylabel="rayon (µm)", title="Rayon par particule (× gris = exclue)")
 
 
 def afficher_resultats(frames, resultats, final, exclues=()):
@@ -710,14 +1061,15 @@ def conditions_acquisition(acq):
     meta = acq["meta"]
     expo = meta.get("exposure_us") or []
     expo = [e for e in expo if e]
-    if "somme" in meta.get("contenu", "").lower() or acq["bayer"]:
+    if "somme" in meta.get("contenu", "").lower() or acq["bayer"] or acq.get("option") in ("A", "B", "C"):
         bits = "12 bits (somme 2x2 : 0–16 380)"
-    elif meta:
+    elif meta or acq.get("option"):
         bits = "12 bits"
     else:
         bits = "8 bits" if acq["frames"].dtype == np.uint8 else "16 bits"
     return dict(echelle_um=acq["pixel_eff"] * 1e6,
-                grossissement=meta.get("grossissement", GROSSISSEMENT),
+                grossissement=(f"{acq['grossissement_reel']:.2f}X (étalonné ; nominal {acq['grossissement_nominal']}X)"
+                               if acq["inc_M"] > 0 else f"{acq['grossissement_nominal']}X (nominal)"),
                 exposition_ms=np.median(expo) / 1e3 if expo else None,
                 fps=1 / acq["dt"], bits=bits)
 
@@ -725,7 +1077,7 @@ def conditions_acquisition(acq):
 def composer_image(acq, k, resultats, detections, bornes, s=1.0, exclues=()):
     """Image k -> image RVB 8 bits annotée, à l'échelle s (1 = résolution native, pour l'export).
     Trajectoires colorées, cercle de 2σ (taille apparente) + étiquette « piste : a » pour chaque bille suivie
-    (« immobile » si D <= 0; en gris avec « exclue » si exclue à la main), cercles rouges pour les autres
+    (en gris avec « exclue » si exclue à la main), cercles rouges pour les autres
     détections, conditions d'acquisition et barre d'échelle."""
     bas, haut = bornes
     img = acq["frames"][k]
@@ -752,7 +1104,7 @@ def composer_image(acq, k, resultats, detections, bornes, s=1.0, exclues=()):
             x, y = r["pos_px"][j]
             rayon = max(3.0, 2 * r["sig_px"][j] * s)
             cv2.circle(rvb, (round(x * s), round(y * s)), round(rayon), c, ep + 1, cv2.LINE_AA)
-            texte = f"{r['a'] * 1e6:.2f} µm" if np.isfinite(r["a"]) else "immobile"
+            texte = f"{r['a'] * 1e6:.2f} µm" if np.isfinite(r["a"]) else "a = ∞"
             if st == "exclue":
                 texte += " (exclue)"
             etiquettes.append(((x * s + rayon + 3, y * s - rayon - 2), f"{r['piste']} : {texte}", c))
@@ -775,7 +1127,7 @@ def annoter(rvb, acq, k, s, etiquettes=()):
     expo = "n/d" if cond["exposition_ms"] is None else f"{cond['exposition_ms']:.2f} ms"
     lignes = [f"t = {acq['temps_s'][k]:.3f} s",
               f"Échelle : {cond['echelle_um']:.4f} µm/pixel",
-              f"Grossissement : {cond['grossissement']}X",
+              f"Grossissement : {cond['grossissement']}",
               f"Temps d'exposition : {expo}",
               f"Fréquence d'acquisition : {cond['fps']:.1f} images/s",
               f"Profondeur de bit : {cond['bits']}"]
@@ -827,20 +1179,22 @@ def exporter(acq, resultats, final, detections, bornes, chemin, exclues=()):
     fichier_csv = base.with_name(base.name + "_analyse.csv")
     with open(fichier_csv, "w", newline="", encoding="utf-8-sig") as f:
         wr = csv.writer(f, delimiter=";")
-        wr.writerow(["piste", "statut", "images", "D_um2_s", "sigma_exp_nm", "a_um", "sigma_PSF_um", "sigma_stat_um",
-                     "sigma_tot_um"])
+        wr.writerow(["piste", "statut", "immobile", "images", "D_um2_s", "D_sur_sigma0", "sigma_exp_nm", "a_um",
+                     "sigma_PSF_um", "sigma_stat_um", "sigma_tot_um"])
         for r in resultats:
-            wr.writerow([r["piste"], statut(r, exclues), r["n_pts"], fmt(r["D"], "%.5f", 1e12),
+            wr.writerow([r["piste"], statut(r, exclues), r["raison_immobile"], r["n_pts"], fmt(r["D"], "%.5f", 1e12),
+                         fmt(r["D"] / r["sigma_D0"], "%.2f", 1) if r["sigma_D0"] > 0 else "",
                          fmt(r["sigma_exp"], "%.1f", 1e9), fmt(r["a"], "%.5f", 1e6) or "inf",
                          fmt(r["inc_psf"], "%.5f", 1e6), fmt(r["inc_stat"], "%.5f", 1e6), fmt(r["inc"], "%.5f", 1e6)])
         wr.writerow([])
         if final:
             wr.writerow(["rayon_final_um", f"{final['a'] * 1e6:.5f}", "incertitude_um", f"{final['inc'] * 1e6:.5f}",
                          "chi2_red", f"{final['chi2_red']:.3f}", "n_particules", final["n"],
-                         "methode", "moyenne des D (immobiles inclus)" if final.get("methode") == "D"
+                         "methode", "moyenne des D" if final.get("methode") == "D"
                          else "moyenne ponderee des rayons"])
         wr.writerow(["pistes_exclues_a_la_main", " ".join(map(str, sorted(exclues))) or "aucune"])
         cond = conditions_acquisition(acq)
+        wr.writerow(["decalages_L_msd", LAG_MAX])
         wr.writerow(["echelle_um_px", f"{cond['echelle_um']:.5f}", "dt_s", f"{acq['dt']:.5f}",
                      "grossissement", cond["grossissement"]])
     print(f"Exporté : {mp4.name} et {fichier_csv.name} (dans {base.parent})")
@@ -858,7 +1212,9 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
     etat = dict(k=0, exclues=set(), final=rayon_final(pistes_moyenne(resultats)), pause=False)
 
     fig = plt.figure(figsize=(17, 9.5))
-    gs = fig.add_gridspec(3, 2, width_ratios=[2.1, 1], height_ratios=[0.6, 1.6, 0.8])
+    # La rangée du tableau grandit avec le nombre de pistes (≈ 12 lignes tiennent dans la hauteur de base)
+    h_tableau = min(1.4, 0.8 * max(1.0, (len(resultats) + 1) / 12))   # plafonné : la police rapetisse ensuite
+    gs = fig.add_gridspec(3, 2, width_ratios=[2.1, 1], height_ratios=[0.6, 1.6, h_tableau])
     ax_v = fig.add_subplot(gs[0:2, 0])
     ax_t = fig.add_subplot(gs[2, 0])
     ax_c = fig.add_subplot(gs[0, 1])
@@ -877,10 +1233,11 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
         D, off = ajuste_msd(pos, dt, LAG_MAX)
         tt = np.linspace(0, lags[-1] * dt, 20)
         pts, = ax_m.plot(lags[ok] * dt, msd[ok] * 1e12, "o", color=col, ms=4)
-        fit, = ax_m.plot(tt, (4 * D * tt + off) * 1e12, "-", color=col, lw=1,
-                         label=str(r["piste"]) + (" (immobile)" if r["immobile"] else ""))
+        fit, = ax_m.plot(tt, (4 * D * tt + (off if np.isfinite(off) else 0)) * 1e12, "-", color=col, lw=1,
+                         label=str(r["piste"]))
         lignes_msd[r["piste"]] = (pts, fit, col)
-    ax_m.set(xlabel="Délai τ (s)", ylabel="MSD (µm²)", title="MSD et ajustement linéaire (Éq. 7)")
+    ax_m.set(xlabel="Délai τ (s)", ylabel="MSD (µm²)",
+             title=f"MSD et ajustement linéaire (Éq. 7) · L = {LAG_MAX} décalage(s)")
     ax_m.grid(alpha=0.3)
     if resultats:
         ax_m.legend(title="piste", fontsize=7, ncol=2)
@@ -896,8 +1253,8 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
             ax_c.text(0.04, 0.48, texte_rayon(final), fontsize=19,
                       fontweight="bold", color="#0b3d6b", transform=ax_c.transAxes)
             if final.get("methode") == "D":
-                details = (f"{final['n']} particule(s), dont {final['n_immobiles']} immobile(s) : "
-                           f"moyenne des D = {final['D_moy'] * 1e12:.4f} µm²/s, puis Stokes-Einstein"
+                details = (f"{final['n']} particule(s) : moyenne des D = {final['D_moy'] * 1e12:.4f} µm²/s, "
+                           f"puis Stokes-Einstein (au moins un D <= 0)"
                            f"\nincertitude = dispersion des D (écart-type / √n)")
             else:
                 chi = f"  ·  χ²réd = {final['chi2_red']:.2f}" if np.isfinite(final["chi2_red"]) else ""
@@ -908,7 +1265,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
         else:
             ax_c.text(0.04, 0.48, "Aucune piste dans la moyenne", fontsize=14, transform=ax_c.transAxes)
             details = ""
-        details += f"\nExclues à la main : {sorted(exclues) if exclues else 'aucune'}"
+        details += f"\nMSD sur L = {LAG_MAX} décalage(s) · exclues à la main : {sorted(exclues) if exclues else 'aucune'}"
         ax_c.text(0.04, 0.05, details, fontsize=8.5, transform=ax_c.transAxes)
 
         ax_r.clear()
@@ -925,16 +1282,21 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
 
         ax_t.clear()
         ax_t.set_axis_off()
+        etat["tab"] = None
         if resultats:
-            tetes = ["Piste", "Statut", "Images", "D (µm²/s)", "σ_exp (nm)", "a (µm)", "σ_PSF (µm)", "σ_stat (µm)",
-                     "σ_tot (µm)"]
+            tetes = ["Piste", "Statut", "Immobile ?", "Images", "D (µm²/s)", "D / σ₀", "σ_exp (nm)", "a (µm)",
+                     "σ_PSF (µm)", "σ_stat (µm)", "σ_tot (µm)"]
             f = lambda v, e, d: f"{v * e:.{d}f}" if np.isfinite(v) else "—"
-            cellules = [[r["piste"], statut(r, exclues), r["n_pts"], f(r["D"], 1e12, 3), f(r["sigma_exp"], 1e9, 0),
+            cellules = [[r["piste"], statut(r, exclues), r["raison_immobile"], r["n_pts"], f(r["D"], 1e12, 3),
+                         f(r["D"] / r["sigma_D0"], 1, 1) if r["sigma_D0"] > 0 else "—", f(r["sigma_exp"], 1e9, 0),
                          f(r["a"], 1e6, 3) if np.isfinite(r["a"]) else "∞", f(r["inc_psf"], 1e6, 3),
                          f(r["inc_stat"], 1e6, 3), f(r["inc"], 1e6, 3)] for r in resultats]
-            tab = ax_t.table(cellText=cellules, colLabels=tetes, loc="upper center", cellLoc="center")
+            # bbox = toute la zone du tableau : les lignes se partagent la hauteur disponible, rien ne déborde
+            tab = ax_t.table(cellText=cellules, colLabels=tetes, bbox=[0, 0, 1, 1], cellLoc="center")
+            etat["tab"] = tab
             tab.auto_set_font_size(False)
-            tab.set_fontsize(8)
+            hauteur_pt = ax_t.get_position().height * fig.get_figheight() * 72    # hauteur de la zone (points)
+            tab.set_fontsize(max(4.0, min(8.0, 0.6 * hauteur_pt / (len(resultats) + 1))))
             for i, r in enumerate(resultats, 1):
                 if r["piste"] in exclues:
                     for j in range(len(tetes)):
@@ -959,23 +1321,38 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
         perdues = int(acq["indices"][-1] + 1 - n)
         fig.suptitle(f"{chemin.name} — image {k + 1}/{n}   {len(presents)} bille(s) suivie(s)"
                      + (f"   ({perdues} images perdues à l'acquisition)" if perdues else "")
-                     + "      [espace = pause · clic = exclure/réintégrer · r = tout réintégrer · e = exporter]",
+                     + "      [espace = pause · clic (vidéo, rayons ou tableau) = exclure/réintégrer · r = tout réintégrer · e = exporter]",
                      fontsize=10)
         return []
 
     def basculer(pids):
         for p in pids:
             etat["exclues"] ^= {p}
-            print(f"Piste {p}{' (immobile)' if par_id[p]['immobile'] else ''} "
-                  f"{'exclue' if p in etat['exclues'] else 'réintégrée'}")
+            print(f"Piste {p} {'exclue' if p in etat['exclues'] else 'réintégrée'}")
         etat["final"] = rayon_final(pistes_moyenne(resultats, etat["exclues"]))
         print("  -> " + texte_final(etat["final"]), flush=True)
         dessiner_panneaux()
         maj(etat["k"])
         fig.canvas.draw_idle()
 
+    def ligne_du_tableau(evt):
+        """Piste de la ligne du tableau sous le clic (n'importe quelle case de la ligne), sinon None."""
+        tab = etat.get("tab")
+        if tab is None:
+            return None
+        for (ligne, _), case in tab.get_celld().items():
+            if ligne >= 1 and case.contains(evt)[0]:
+                return resultats[ligne - 1]["piste"]
+        return None
+
     def clic(evt):
-        if evt.xdata is None or not resultats or fig.canvas.toolbar is not None and fig.canvas.toolbar.mode:
+        if not resultats or fig.canvas.toolbar is not None and fig.canvas.toolbar.mode:
+            return
+        p = ligne_du_tableau(evt)                        # tableau : clic sur le numéro (ou la ligne)
+        if p is not None:
+            basculer([p])
+            return
+        if evt.xdata is None:
             return
         if evt.inaxes is ax_v:                           # bille la plus proche dans l'image affichée
             slot = acq["indices"][etat["k"]]
@@ -1055,11 +1432,39 @@ def choisir_fichier(dossier=DOSSIER_DONNEES):
         taille = (sum(q.stat().st_size for q in p.iterdir()) if p.is_dir() else p.stat().st_size) / 1e6
         print(f"  {k}. [{lettre_option(p)}] {p.name}   ({taille:.0f} Mo)"
               + ("" if chemin_json(p).exists() else "   (pas de .json)"))
+    # .json d'acquisition dont les images n'ont pas été copiées : signalés, mais pas sélectionnables
+    orphelins = []
+    for j in sorted(dossier.glob("acq_*.json")):
+        try:
+            images = json.loads(j.read_text(encoding="utf-8")).get("fichier_images")
+        except (OSError, ValueError):
+            continue
+        if images and not (dossier / images).exists():
+            orphelins.append((j, images))
+    if orphelins:
+        print("  Non disponibles (le .json est là, mais pas les images : copier depuis la Pi) :")
+        for j, images in orphelins:
+            print(f"     [{lettre_option(j)}] {images}")
     while True:
         rep = input(f"Numéro du fichier (1-{len(candidats)}) : ").strip()
         if rep.isdigit() and 1 <= int(rep) <= len(candidats):
             return candidats[int(rep) - 1]
         print("  Choix invalide.")
+
+
+def choisir_lag():
+    """Nombre de décalages L (1 à 5) utilisés pour ajuster le MSD."""
+    while True:
+        rep = input(f"Nombre de décalages L pour le MSD (1 à 5) [Entrée = {LAG_MAX}] : ").strip()
+        if not rep:
+            return LAG_MAX
+        if rep in ("1", "2", "3", "4", "5"):
+            L = int(rep)
+            if L == 1:
+                print("  L = 1 : droite forcée par l'origine. L'erreur de localisation n'est pas retirée :\n"
+                      "  D est surestimé d'environ σ_exp²/Δt (σ_exp n'est pas estimé).")
+            return L
+        print("  Taper un entier de 1 à 5.")
 
 
 def choisir_analyse():
@@ -1079,9 +1484,28 @@ def choisir_analyse():
 if __name__ == "__main__":
     chemin = choisir_fichier()
     analyse = choisir_analyse()
+    LAG_MAX = choisir_lag()          # global du module : utilisé par l'ajustement, l'affichage et l'export
+
+    fps_sans_json = None
+    if not chemin_json(chemin).exists() and chemin.suffix.lower() not in EXTENSIONS_VIDEO:
+        option, G = infos_depuis_nom(chemin)
+        print(f"\nATTENTION : pas de .json pour {chemin.name} (pas d'horodatages : les images perdues ne seront "
+              f"pas détectées). Copier le .json depuis la Pi si possible.")
+        if option:
+            print(f"  Option {option} et grossissement {G:g}X lus dans le nom du fichier.")
+        defaut = fps_par_defaut(chemin)
+        while True:
+            rep = input(f"  fps de l'acquisition [Entrée = {defaut:.2f}] : ").strip().replace(",", ".")
+            try:
+                fps_sans_json = float(rep) if rep else defaut
+                if fps_sans_json > 0:
+                    break
+            except ValueError:
+                pass
+            print("  Entrer un nombre positif.")
 
     print(f"\nChargement de {chemin.name}...", flush=True)
-    acq = charger_acquisition(chemin)
+    acq = charger_acquisition(chemin, fps_sans_json)
     frames, dt, pixel_eff, meta = acq["frames"], acq["dt"], acq["pixel_eff"], acq["meta"]
     n, h, w = frames.shape
     perdues = int(acq["indices"][-1] + 1 - n)
@@ -1090,12 +1514,15 @@ if __name__ == "__main__":
     print(f"Nombre de frames : {n}" + (f"  ({perdues} images perdues à l'acquisition)" if perdues else ""))
     print(f"Résolution       : {w} x {h} pixels" + ("  (après somme 2x2 du Bayer)" if acq["bayer"] else ""))
     print(f"Δt               : {dt * 1e3:.1f} ms  ({1 / dt:.2f} fps)")
+    print(f"MSD              : ajusté sur L = {LAG_MAX} décalage(s), de Δt à {LAG_MAX}·Δt")
     print(f"Durée            : {acq['temps_s'][-1]:.2f} s")
-    print(f"Pixel (objet)    : {pixel_eff * 1e6:.4f} µm/px" + (f"  (grossissement {meta['grossissement']}X)"
-                                                             if meta.get("grossissement") else ""))
+    M, inc_M = acq["grossissement_reel"], acq["inc_M"]
+    print(f"Grossissement    : {M:.3f} ± {inc_M:.3f}  (nominal {acq['grossissement_nominal']}X)"
+          + (f"  -> incertitude d'étalonnage sur a : 2·δM/M = {200 * inc_M / M:.2f} %" if inc_M else ""))
+    print(f"Pixel (objet)    : {pixel_eff * 1e6:.4f} µm/px")
     print(f"Source           : {acq['source']}")
-    if not meta:
-        print("ATTENTION : pas de .json -> grossissement, taille de pixel et fps tirés des constantes du script.")
+    if not meta and not acq["option"]:
+        print("ATTENTION : pas de .json ni d'option dans le nom -> grossissement, pixel et fps tirés des constantes.")
 
     kw_det, dist_max_px, demi = parametres_pixels(pixel_eff)
 
@@ -1107,6 +1534,13 @@ if __name__ == "__main__":
 
     sigma_psf, disp_psf, n_fit = estimer_sigma_psf(frames, demi=demi, **kw_det)
     print(f"σ_PSF mesuré : {sigma_psf:.2f} ± {disp_psf:.2f} px ({sigma_psf*pixel_eff*1e6:.2f} µm), {n_fit} PSF")
+    # Garde-fous tirés de la taille MESURÉE des taches (indépendants de l'échelle supposée) :
+    # - deux maxima à moins de 2σ appartiennent à la même bille (évite les doubles détections);
+    # - une bille peut se déplacer d'au moins 1,5σ entre deux images sans changer de numéro.
+    kw_det["distance_min"] = max(kw_det["distance_min"], int(np.ceil(2 * sigma_psf)))
+    dist_max_px = max(dist_max_px, 1.5 * sigma_psf)
+    print(f"Détection : distance min. entre billes = {kw_det['distance_min']} px · "
+          f"déplacement max. entre images = {dist_max_px:.1f} px")
 
     detections = localiser_toutes_frames(frames, sigma_psf, **kw_det)
     pistes = lier_trajectoires(detections, acq["indices"], dist_max_px=dist_max_px, trou_max=TROU_MAX)
