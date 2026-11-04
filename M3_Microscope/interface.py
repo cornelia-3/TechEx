@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Interface graphique – Mandat 3 (PHS3910) : suivi de particules et mesure du rayon
 ==================================================================================
