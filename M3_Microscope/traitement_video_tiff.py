@@ -11,6 +11,9 @@ Au lancement, deux choix dans le terminal :
          apparente) et son rayon estimé; cercles rouges = autres détections. À droite : carte « rayon moyen »,
          MSD avec ajustements et rayon par piste (pistes visibles mises en évidence); dessous : tableau.
          Espace = pause · e = exporter <nom>_annote.mp4 + <nom>_analyse.csv à côté du fichier.
+         Flèches ◀ ▶ au-dessus de la vidéo (ou touches ← →) : zoom sur la trajectoire de chaque bille
+         sélectionnée, à tour de rôle (vidéo agrandie autour de la trajectoire, vrais pixels visibles),
+         puis retour à la vue d'ensemble.
 
 Exclusion À LA MAIN, une fois l'analyse faite (rien n'est exclu automatiquement) :
   - analyse 1 : après la figure, taper dans le terminal les numéros des pistes à exclure / réintégrer;
@@ -19,8 +22,12 @@ Exclusion À LA MAIN, une fois l'analyse faite (rien n'est exclu automatiquement
 Toutes les pistes sont traitées de la même façon et toutes les valeurs du tableau sont calculées pour
 chacune (D, σ_exp, a, σ_PSF, σ_stat, σ_tot), même quand D <= 0 (a est alors négatif). Aucune piste n'est
 qualifiée ni écartée automatiquement : c'est l'utilisateur qui choisit. Rayon moyen des pistes sélectionnées :
-moyenne pondérée des rayons si toutes ont D > 0; sinon (un rayon négatif ne se moyenne pas) moyenne des D,
-puis a = kT / (6πη·D_moyen).
+moyenne des D, puis a = kT / (6πη·D_moyen) (moyenner les rayons serait biaisé de ≈ +6 %, car a ∝ 1/D).
+
+Option au lancement : retirer le MOUVEMENT COMMUN (vibration, dérive) mesuré sur les billes immobiles avant le
+calcul du MSD (les billes immobiles servent de référence; chacune n'est corrigée qu'avec les AUTRES). Sans cette
+correction, une vibration d'allers-retours fait baisser le MSD entre Δt et 3Δt : D négatif pour les billes
+collées, D sous-estimé pour les billes libres.
 
 Les paramètres d'acquisition sont lus dans le .json écrit à côté de chaque pile par acquisition_raspberry.py :
   - le temps de chaque image (horodatages du capteur) -> Δt réel, et les images perdues deviennent des trous
@@ -37,6 +44,7 @@ import csv
 import json
 import math
 import re
+import warnings
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +54,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile                      # pip install tifffile
 from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage as ndi
 from scipy.optimize import curve_fit, linear_sum_assignment
@@ -60,7 +69,7 @@ DOSSIER_DONNEES = Path(__file__).resolve().parent / "techex_M3_videos"   # TechE
 # dense_up_contraste.mp4, grossissement 10X, on détecte 15 particules : 2.499 µm  ± 0.140 µm (σ_PSF = 0.052 ⊕ σ_stat = 0.130), 17 particules, χ²_red = 349.89
 # constantes
 kB = 1.380649e-23          # J/K
-T = 22 + 273               # K
+T = 22 + 273.15            # K (eau à 22 °C)
 ETA = 0.95e-3              # Pa·s (eau à 22 °C)
 
 # Valeurs par défaut, utilisées SEULEMENT quand il n'y a pas de .json (anciens mp4, TIFF externes)
@@ -69,6 +78,7 @@ TAILLE_PIXEL = 1.55e-6     # m
 REDUCTION = 4056 / 640     # nbr pixels capteur / nbr pixels image (mp4 de 640 px de large)
 PIXEL_EFF = TAILLE_PIXEL * REDUCTION / GROSSISSEMENT        # m/pixel dans le plan objet
 FPS_DEFAUT = 30.0
+INFO_VIBRATION = {}        # option « retirer le mouvement commun » et pistes de référence (affichage, export)
 
 # Paramètres de détection et de suivi, en µm dans le plan objet (convertis en pixels selon le fichier).
 # Avec les anciens mp4 (0,49 µm/px), ils redonnent exactement les valeurs en pixels d'avant (1,5 / 5 / 3 / 8 px).
@@ -98,7 +108,7 @@ EXTENSIONS_VIDEO = {".mp4", ".avi", ".h264", ".mov"}
 #############################################################################################################
 
 ETALONNER = True              # False = grossissement nominal du .json, sans règle
-PAS_GRADUATION = 100e-6       # m entre deux graduations consécutives de la règle  <-- À CONFIRMER
+PAS_GRADUATION = 100e-6       # m entre deux graduations consécutives de la règle (confirmé)
 F_TUBE = 150e-3               # m, focale de la lentille de tube (sert seulement à l'affichage)
 EXTENSIONS_REGLE = {".png", ".tif", ".tiff", ".jpg"}
 VERSION_ETALONNAGE = 2        # à incrémenter si la méthode change : les caches existants sont alors refaits
@@ -489,7 +499,10 @@ def charger_acquisition(chemin, fps_sans_json=None):
         source_temps = f"fps = {fps:g} ({origine})"
     indices = np.round(t / dt).astype(int)
 
-    return dict(frames=frames, temps_s=t, indices=indices, dt=dt, pixel_eff=pixel_eff, meta=meta,
+    expo = [e for e in meta.get("exposure_us", []) if e]
+    t_exp = (np.median(expo) * 1e-6 if expo else
+             (min(0.090, dt) if option else 0.0))           # 90 ms : exposition du script d'acquisition
+    return dict(frames=frames, temps_s=t, indices=indices, dt=dt, pixel_eff=pixel_eff, meta=meta, t_exp=t_exp,
                 bayer=bayer, option=option, grossissement_nominal=G_nominal, grossissement_reel=M, inc_M=inc_M,
                 source=f"pixel capteur : {source_pixel} · grossissement : {source_M} · temps : {source_temps}")
 
@@ -595,6 +608,50 @@ def compter_sur_toutes_les_frames(frames, **kwargs):
     print(f"Particules par frame : min={comptes.min()}, max={comptes.max()}, "
           f"moyenne={comptes.mean():.1f}")
     return comptes
+
+#############################################################################################################
+#                       MOUVEMENT COMMUN (VIBRATION) — option posée au lancement
+#   Toutes les billes bougent ensemble d'une image à l'autre (vibration de la platine ou du support, dérive) :
+#   ce mouvement s'ajoute au MSD de chaque bille. Il est mesuré sur les billes IMMOBILES (colonne « Immobile ? »)
+#   et retiré des positions avant le calcul du MSD. Les trajectoires affichées restent les positions réelles.
+#############################################################################################################
+
+def mouvement_commun(pistes_tab, refs, n_creneaux, sauf=None):
+    """Mouvement commun à toutes les billes (vibration + dérive), par créneau : médiane, sur les pistes de
+    RÉFÉRENCE (billes immobiles), de l'écart à leur position moyenne. sauf : piste à exclure des références
+    (pour corriger une référence, on n'utilise que les AUTRES, sinon elle se corrige par elle-même).
+    Créneaux avec moins de 2 références : interpolés. Retourne (n_creneaux, 2) en pixels."""
+    refs = [p for p in refs if p != sauf]
+    M = np.full((max(len(refs), 1), n_creneaux, 2), np.nan)
+    for i, p in enumerate(refs):
+        q = pistes_tab[p]["pos_px"]
+        M[i, pistes_tab[p]["f0"]:pistes_tab[p]["f0"] + len(q)] = q - np.nanmean(q, axis=0)
+    n = np.sum(np.isfinite(M[:, :, 0]), axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)      # créneau sans aucune référence
+        c = np.nanmedian(M, axis=0)
+    c[n < 2] = np.nan
+    for a in range(2):
+        ok = np.isfinite(c[:, a])
+        c[:, a] = np.interp(np.arange(n_creneaux), np.flatnonzero(ok), c[ok, a]) if ok.any() else 0.0
+    return c
+
+
+def corriger_vibration(pistes_tab, resultats, n_creneaux):
+    """Retire de chaque piste le mouvement commun mesuré sur les billes immobiles (colonne « Immobile ? »).
+    Retourne (pistes corrigées, références, écart type du mouvement commun en px) ou (None, refs, nan)
+    s'il y a moins de 2 billes immobiles."""
+    refs = [i for i, r in enumerate(resultats) if r["immobile"]]           # indices dans pistes_tab
+    noms = [resultats[i]["piste"] for i in refs]
+    if len(refs) < 2:
+        return None, noms, np.nan
+    c_tous = mouvement_commun(pistes_tab, refs, n_creneaux)
+    corrigees = []
+    for i, t in enumerate(pistes_tab):
+        c = mouvement_commun(pistes_tab, refs, n_creneaux, sauf=i) if i in refs else c_tous
+        corrigees.append(dict(t, pos_px=t["pos_px"] - c[t["f0"]:t["f0"] + len(t["pos_px"])]))
+    return corrigees, noms, float(np.std(np.diff(c_tous, axis=0)))
+
 
 #############################################################################################################
 #                                       TRACKING ET CALCUL DU RAYON
@@ -817,17 +874,21 @@ def pistes_en_tableaux(pistes, n_min=20):
     return sorties
 
 
-def rayon_piste_complet(pos_px, inc_px, dt, pixel_eff=PIXEL_EFF, lag_max=3):
+def rayon_piste_complet(pos_px, inc_px, dt, pixel_eff=PIXEL_EFF, lag_max=3, t_exp=0.0):
     """Comme rayon_piste, mais calcule TOUT pour toutes les pistes, y compris D <= 0 :
     a = kT / (6πηD) (négatif si D < 0, infini si D = 0), incertitudes propagées par δa = |a|·δD/|D|.
-    σ_stat utilise |D| comme variance d'un pas (une variance ne peut pas être négative)."""
+    σ_stat utilise |D| comme variance d'un pas (une variance ne peut pas être négative).
+    σ_exp : l'exposition t_exp moyenne la position pendant le mouvement (flou de mouvement), ce qui abaisse
+    l'ordonnée du MSD : MSD = 2nDτ + 2nσ_exp² − (2n/3)·D·t_exp (Savin & Doyle, 2005). La pente, donc D,
+    n'est pas touchée; on corrige seulement σ_exp² = ordonnée/(2n) + D·t_exp/3."""
     pos, inc = pos_px * pixel_eff, inc_px * pixel_eff
     n_dim = pos.shape[1]
     D, offset = ajuste_msd(pos, dt, lag_max)
     nan = dict(a=np.nan, D=D, sigma_exp=np.nan, inc_psf=np.nan, inc_stat=np.nan, inc=np.nan)
     if not np.isfinite(D):
         return nan
-    sigma_exp = np.sqrt(max(offset, 0) / (2 * n_dim))
+    s2 = offset / (2 * n_dim) + max(D, 0) * t_exp / 3 if np.isfinite(offset) else np.nan
+    sigma_exp = np.sqrt(s2) if np.isfinite(s2) and s2 > 0 else (0.0 if np.isfinite(s2) else np.nan)
     if D == 0:
         return {**nan, "a": np.inf, "sigma_exp": sigma_exp}
     a = kB * T / (6 * np.pi * ETA * D)
@@ -843,15 +904,16 @@ def analyser_pistes(pistes_tab, dt, **kw):
     resultats = []
     rng = np.random.default_rng(0)                   # graine fixe : la colonne « immobile ? » est reproductible
     for num, p in enumerate(pistes_tab):
-        r = rayon_piste_complet(p["pos_px"], p["inc_px"], dt, **kw)
+        r = rayon_piste_complet(p["pos_px"], p["inc_px"], dt, **kw)          # kw : pixel_eff, lag_max, t_exp
         r.update(piste=num, f0=p["f0"], pos_px=p["pos_px"], sig_px=p["sig_px"],
                  n_pts=int(np.isfinite(p["pos_px"][:, 0]).sum()))
-        r.update(test_immobile(r, p, dt, kw.get("pixel_eff", PIXEL_EFF), kw.get("lag_max", 3), rng))
+        r.update(test_immobile(r, p, dt, kw.get("pixel_eff", PIXEL_EFF), kw.get("lag_max", 3), rng,
+                               kw.get("t_exp", 0.0)))
         resultats.append(r)
     return resultats
 
 
-def test_immobile(r, piste, dt, pixel_eff, lag_max, rng):
+def test_immobile(r, piste, dt, pixel_eff, lag_max, rng, t_exp=0.0):
     """Critère « immobile ? » (indicatif seulement). Une bille est jugée immobile si :
       1) son D n'est pas significativement plus grand que celui qu'on mesurerait sur une bille parfaitement
          immobile : D < SEUIL_IMMOBILE_SIGMA · σ_D0, où σ_D0 est la dispersion de D obtenue en simulant
@@ -884,46 +946,47 @@ def pistes_moyenne(resultats, exclues=()):
     return [r for r in resultats if statut(r, exclues) != "exclue"]
 
 
-def rayon_final(resultats):
-    """Rayon moyen des pistes données. None s'il n'y en a aucune.
+def rayon_final(resultats, birge=False):
+    """Rayon moyen des pistes données (None s'il n'y en a aucune).
 
-    Si toutes les pistes ont D > 0 : moyenne pondérée des rayons, poids = 1/(incertitude RELATIVE)² (pondérer par 1/σ²
-    biaiserait vers les petits rayons, car σ est proportionnelle à a). σ_PSF et σ_stat sont propagées
-    séparément puis sommées en quadrature.
+    On moyenne les coefficients de diffusion, PAS les rayons : D_moy = (1/n) Σ D_i, puis Stokes-Einstein
+    a = kT / (6πη·D_moy). Raison : a ∝ 1/D, et la moyenne de 1/D_i est biaisée vers le haut d'environ
+    (σ_D/D)² ≈ +6 % pour des pistes de 67 images (vérifié par simulation), alors que D_i est sans biais.
+    Ça permet aussi d'inclure les pistes à D <= 0 sans traitement spécial.
 
-    Si au moins une piste a D <= 0 (rayon négatif ou infini, qui ne se moyenne pas) : on moyenne les
-    coefficients de diffusion D de toutes les pistes, puis a = kT / (6πη D_moyen) (Stokes-Einstein).
-    Incertitude : dispersion des D (écart-type / √n), propagée par δa/a = δD/D. Si D_moyen <= 0, a = ∞."""
-    resultats = list(resultats)
+    Incertitudes : σ_PSF et σ_stat de chaque D_i propagées à la moyenne (σ_D_moy = √Σσ_i² / n), puis
+    δa/a = δD_moy/D_moy. χ²_red compare la dispersion des D_i à leurs incertitudes (≈ 1 : cohérentes;
+    >> 1 : billes hétérogènes — collées, freinées par la paroi... — ou incertitudes sous-estimées).
+    Il est TOUJOURS calculé et affiché, mais l'incertitude n'est multipliée par le facteur de Birge
+    max(1, √χ²_red) que si birge=True (bascule au choix de l'utilisateur). « inc_birge » donne
+    l'incertitude ajustée dans tous les cas, pour comparaison. Si D_moy <= 0 : a = ∞."""
+    resultats = [r for r in resultats if np.isfinite(r["D"])]
     if not resultats:
         return None
-    if any(not r["D"] > 0 for r in resultats):
-        D = np.array([r["D"] for r in resultats], dtype=float)
-        n = len(D)
-        D_moy = D.mean()
-        inc_D = D.std(ddof=1) / np.sqrt(n) if n > 1 else np.nan
-        if D_moy > 0:
-            a = kB * T / (6 * np.pi * ETA * D_moy)
-            inc = a * inc_D / D_moy
-        else:
-            a, inc = np.inf, np.nan
-        return dict(a=a, inc_psf=np.nan, inc_stat=inc, inc=inc, chi2_red=np.nan, n=n, D_moy=D_moy, methode="D")
-    resultats = [r for r in resultats if np.isfinite(r["a"]) and np.isfinite(r["inc"]) and r["inc"] > 0]
-    if not resultats:
-        return None
-    a = np.array([r["a"] for r in resultats])
-    s_psf = np.array([r["inc_psf"] for r in resultats])
-    s_stat = np.array([r["inc_stat"] for r in resultats])
-    s = np.hypot(s_psf, s_stat)
-    w = (a / s)**2
-    W = w.sum()
-    a_fin = np.sum(w * a) / W
-    inc_psf = np.sqrt(np.sum(w**2 * s_psf**2)) / W
-    inc_stat = np.sqrt(np.sum(w**2 * s_stat**2)) / W
-    n = len(a)
-    chi2_red = np.sum((a - a_fin)**2 / s**2) / (n - 1) if n > 1 else np.nan
-    return dict(a=a_fin, inc_psf=inc_psf, inc_stat=inc_stat, inc=np.hypot(inc_psf, inc_stat),
-                chi2_red=chi2_red, n=n, methode="a")
+    D = np.array([r["D"] for r in resultats])
+    # incertitudes sur D de chaque piste (δD = |D|·δa/|a|)
+    rel = lambda r, cle: r[cle] / abs(r["a"]) * abs(r["D"]) if np.isfinite(r[cle]) and np.isfinite(r["a"]) \
+        and r["a"] != 0 else np.nan
+    sD_psf = np.array([rel(r, "inc_psf") for r in resultats])
+    sD_stat = np.array([rel(r, "inc_stat") for r in resultats])
+    n = len(D)
+    D_moy = D.mean()
+    sDm_psf = np.sqrt(np.nansum(sD_psf**2)) / n
+    sDm_stat = np.sqrt(np.nansum(sD_stat**2)) / n
+    sD = np.hypot(sD_psf, sD_stat)
+    ok = np.isfinite(sD) & (sD > 0)
+    chi2_red = np.sum((D[ok] - D_moy)**2 / sD[ok]**2) / (ok.sum() - 1) if ok.sum() > 1 else np.nan
+    facteur = max(1.0, np.sqrt(chi2_red)) if np.isfinite(chi2_red) else 1.0
+    applique = facteur if birge else 1.0
+    commun = dict(chi2_red=chi2_red, n=n, D_moy=D_moy, inc_D=np.hypot(sDm_psf, sDm_stat) * applique,
+                  birge=facteur, birge_applique=bool(birge), methode="D")
+    if D_moy <= 0:
+        return dict(a=np.inf, inc_psf=np.nan, inc_stat=np.nan, inc=np.nan, inc_birge=np.nan, **commun)
+    a = kB * T / (6 * np.pi * ETA * D_moy)
+    inc_psf, inc_stat = a * sDm_psf / D_moy, a * sDm_stat / D_moy
+    inc_brute = np.hypot(inc_psf, inc_stat)
+    return dict(a=a, inc_psf=inc_psf, inc_stat=inc_stat, inc=inc_brute * applique, inc_birge=inc_brute * facteur,
+                **commun)
 
 
 def texte_rayon(final):
@@ -933,15 +996,25 @@ def texte_rayon(final):
     return f"a = {final['a'] * 1e6:.3f} ± {inc} µm"
 
 
+def texte_birge(final):
+    """χ²_red et effet du facteur de Birge, appliqué ou non."""
+    if not np.isfinite(final["chi2_red"]):
+        return "χ²_red non défini (1 seule particule)"
+    t = f"χ²_red = {final['chi2_red']:.2f}"
+    if not np.isfinite(final["a"]) or final["birge"] <= 1:
+        return t + (" (≤ 1 : Birge sans effet)" if final["birge"] <= 1 else "")
+    if final["birge_applique"]:
+        return t + f", Birge APPLIQUÉ (× {final['birge']:.2f})"
+    return t + f", Birge non appliqué (avec : ± {final['inc_birge'] * 1e6:.3f} µm)"
+
+
 def texte_final(final):
     if final is None:
         return "Rayon final : aucune piste dans la moyenne."
-    if final.get("methode") == "D":
-        return (f"Rayon final : {texte_rayon(final)}  (moyenne des D sur {final['n']} pistes : "
-                f"D moyen = {final['D_moy'] * 1e12:.4f} µm²/s, puis Stokes-Einstein)")
-    return (f"Rayon final : {final['a']*1e6:.3f} µm  ± {final['inc']*1e6:.3f} µm "
-            f"(σ_PSF = {final['inc_psf']*1e6:.3f} ⊕ σ_stat = {final['inc_stat']*1e6:.3f}), "
-            f"{final['n']} particules, χ²_red = {final['chi2_red']:.2f}")
+    morceaux = [f"{final['n']} particules", f"D moyen = {final['D_moy'] * 1e12:.4f} µm²/s", texte_birge(final)]
+    if np.isfinite(final["a"]):
+        morceaux.insert(0, f"σ_PSF = {final['inc_psf'] * 1e6:.3f} ⊕ σ_stat = {final['inc_stat'] * 1e6:.3f} µm")
+    return f"Rayon final : {texte_rayon(final)}  (" + " ; ".join(morceaux) + ")"
 
 
 def imprimer_resultats(resultats, final, exclues=()):
@@ -955,22 +1028,26 @@ def imprimer_resultats(resultats, final, exclues=()):
     print("\n" + texte_final(final))
 
 
-def choisir_exclusions(resultats, exclues=None):
+def choisir_exclusions(resultats, exclues=None, birge=False):
     """Après l'analyse : on tape les numéros des pistes à exclure (ou à réintégrer) de la moyenne,
-    autant de fois qu'on veut; Entrée seule pour terminer. Retourne (exclues, final)."""
+    autant de fois qu'on veut; « b » active/désactive le facteur de Birge; Entrée seule pour terminer.
+    Retourne (exclues, final, birge)."""
     exclues = set(exclues or ())
     ids = {r["piste"] for r in resultats}
     while True:
-        final = rayon_final(pistes_moyenne(resultats, exclues))
+        final = rayon_final(pistes_moyenne(resultats, exclues), birge)
         print()
         imprimer_resultats(resultats, final, exclues)
-        rep = input("\nPistes à exclure ou à réintégrer (ex. 0 4 8) · Entrée = terminé : ").strip()
+        rep = input("\nPistes à exclure ou à réintégrer (ex. 0 4 8) · b = Birge oui/non · Entrée = terminé : ").strip()
         if not rep:
             if exclues:
                 print(f"Pistes exclues à la main : {sorted(exclues)}")
-            return exclues, final
+            return exclues, final, birge
         for t in rep.replace(",", " ").split():
-            if t.isdigit() and int(t) in ids:
+            if t.lower() == "b":
+                birge = not birge
+                print(f"  Facteur de Birge {'appliqué' if birge else 'non appliqué'}.")
+            elif t.isdigit() and int(t) in ids:
                 exclues ^= {int(t)}
             else:
                 print(f"  « {t} » n'est pas un numéro de piste ({sorted(ids)}).")
@@ -987,7 +1064,7 @@ def tracer_rayons(ax, resultats, final, exclues=()):
         ax.axhline(final["a"] * 1e6, color="tab:green")
         ax.axhspan((final["a"] - final["inc"]) * 1e6, (final["a"] + final["inc"]) * 1e6, color="tab:green",
                    alpha=0.2, label="final : " + texte_rayon(final)
-                   + (" (moyenne des D)" if final.get("methode") == "D" else ""))
+                   + " (via D moyen)")
         ax.legend()
     a = np.array([r["a"] for r in finis])
     if len(a) and a.min() > 0 and a.max() / a.min() > 20:   # grand écart (tous positifs) : échelle log
@@ -1074,20 +1151,39 @@ def conditions_acquisition(acq):
                 fps=1 / acq["dt"], bits=bits)
 
 
-def composer_image(acq, k, resultats, detections, bornes, s=1.0, exclues=()):
-    """Image k -> image RVB 8 bits annotée, à l'échelle s (1 = résolution native, pour l'export).
+def composer_image(acq, k, resultats, detections, bornes, s=1.0, exclues=(), region=None, cible=None, focus=None):
+    """Image k -> image RVB 8 bits annotée.
+    Vue d'ensemble : toute l'image à l'échelle s (1 = résolution native, pour l'export).
+    Zoom : region = (x0, y0, x1, y1) en pixels natifs, agrandie pour remplir exactement cible = (largeur, hauteur);
+    focus = n° de la piste zoomée (trait plus épais; seule la partie déjà parcourue est dessinée).
     Trajectoires colorées, cercle de 2σ (taille apparente) + étiquette « piste : a » pour chaque bille suivie
-    (en gris avec « exclue » si exclue à la main), cercles rouges pour les autres
-    détections, conditions d'acquisition et barre d'échelle."""
+    (en gris avec « exclue » si exclue à la main), cercles rouges pour les autres détections,
+    conditions d'acquisition et barre d'échelle."""
     bas, haut = bornes
     img = acq["frames"][k]
+    x0 = y0 = 0
+    if region is not None:
+        x0, y0, x1, y1 = region
+        img = img[y0:y1, x0:x1]
     v8 = np.clip((img.astype(np.float32) - bas) * (255.0 / (haut - bas)), 0, 255).astype(np.uint8)
-    if s != 1.0:
-        v8 = cv2.resize(v8, (round(v8.shape[1] * s), round(v8.shape[0] * s)), interpolation=cv2.INTER_AREA)
+    if region is not None:
+        cw, ch = cible
+        sx, sy = cw / v8.shape[1], ch / v8.shape[0]
+        # agrandissement : plus proche voisin, pour voir les vrais pixels de la caméra
+        v8 = cv2.resize(v8, (cw, ch), interpolation=cv2.INTER_NEAREST if sx >= 2 else cv2.INTER_LINEAR)
+    else:
+        sx = sy = s
+        if s != 1.0:
+            v8 = cv2.resize(v8, (round(v8.shape[1] * s), round(v8.shape[0] * s)), interpolation=cv2.INTER_AREA)
     rvb = cv2.cvtColor(v8, cv2.COLOR_GRAY2RGB)
     h, w = rvb.shape[:2]
     ep = max(1, round(w / 700))
     slot = acq["indices"][k]
+
+    # pixel natif (x, y) -> pixel affiché : le centre du pixel i couvre [i - 0.5, i + 0.5]
+    def vers_ecran(xy):
+        xy = np.asarray(xy, dtype=float)
+        return np.stack([(xy[..., 0] - x0 + 0.5) * sx - 0.5, (xy[..., 1] - y0 + 0.5) * sy - 0.5], axis=-1)
 
     etiquettes, suivis = [], []
     for r in resultats:
@@ -1096,24 +1192,49 @@ def composer_image(acq, k, resultats, detections, bornes, s=1.0, exclues=()):
             continue
         st = statut(r, exclues)
         c = GRIS_EXCLUE if st == "exclue" else couleur_piste(r["piste"])
+        epp = ep * (2 if r["piste"] == focus else 1)
         pts = r["pos_px"][:j + 1]
-        pts = pts[np.isfinite(pts[:, 0])] * s
+        pts = vers_ecran(pts[np.isfinite(pts[:, 0])])
         if len(pts) > 1:
-            cv2.polylines(rvb, [np.round(pts).astype(np.int32).reshape(-1, 1, 2)], False, c, ep, cv2.LINE_AA)
+            cv2.polylines(rvb, [np.round(pts).astype(np.int32).reshape(-1, 1, 2)], False, c, epp, cv2.LINE_AA)
         if np.isfinite(r["pos_px"][j, 0]):
             x, y = r["pos_px"][j]
-            rayon = max(3.0, 2 * r["sig_px"][j] * s)
-            cv2.circle(rvb, (round(x * s), round(y * s)), round(rayon), c, ep + 1, cv2.LINE_AA)
+            X, Y = vers_ecran((x, y))
+            rayon = max(3.0, 2 * r["sig_px"][j] * sx)
+            cv2.circle(rvb, (round(X), round(Y)), round(rayon), c, epp + 1, cv2.LINE_AA)
             texte = f"{r['a'] * 1e6:.2f} µm" if np.isfinite(r["a"]) else "a = ∞"
             if st == "exclue":
                 texte += " (exclue)"
-            etiquettes.append(((x * s + rayon + 3, y * s - rayon - 2), f"{r['piste']} : {texte}", c))
+            etiquettes.append(((X + rayon + 3, Y - rayon - 2), f"{r['piste']} : {texte}", c))
             suivis.append((x, y))
     det = detections[k]
     for x, y in det[:, :2] if len(det) else []:
         if not suivis or min(np.hypot(x - a, y - b) for a, b in suivis) > 1:
-            cv2.circle(rvb, (round(x * s), round(y * s)), 7 * ep, ROUGE_DET, ep, cv2.LINE_AA)
-    return annoter(rvb, acq, k, s, etiquettes)
+            X, Y = vers_ecran((x, y))
+            cv2.circle(rvb, (round(X), round(Y)), 7 * ep, ROUGE_DET, ep, cv2.LINE_AA)
+    return annoter(rvb, acq, k, sx, etiquettes)
+
+
+def contraste_region(img, region):
+    """Bornes d'affichage calculées sur une région (x0, y0, x1, y1) seulement."""
+    x0, y0, x1, y1 = region
+    bas, haut = np.percentile(img[y0:y1, x0:x1], (0.5, 99.9))
+    return bas, max(haut, bas + 1)
+
+
+def region_zoom(r, forme, rapport, marge_px):
+    """Région (x0, y0, x1, y1), en pixels natifs, qui contient toute la trajectoire de la piste r avec une marge,
+    au même rapport largeur/hauteur que la vue d'ensemble (la vidéo garde sa taille à l'écran)."""
+    H, W = forme
+    pos = r["pos_px"][np.isfinite(r["pos_px"][:, 0])]
+    cx, cy = (pos.min(axis=0) + pos.max(axis=0)) / 2
+    larg = max(np.ptp(pos[:, 0]) + 2 * marge_px, (np.ptp(pos[:, 1]) + 2 * marge_px) * rapport, 24)
+    larg = min(larg, W)
+    haut = min(larg / rapport, H)
+    larg = haut * rapport
+    x0 = int(round(min(max(cx - larg / 2, 0), W - larg)))
+    y0 = int(round(min(max(cy - haut / 2, 0), H - haut)))
+    return x0, y0, x0 + int(round(larg)), y0 + int(round(haut))
 
 
 def annoter(rvb, acq, k, s, etiquettes=()):
@@ -1189,12 +1310,16 @@ def exporter(acq, resultats, final, detections, bornes, chemin, exclues=()):
         wr.writerow([])
         if final:
             wr.writerow(["rayon_final_um", f"{final['a'] * 1e6:.5f}", "incertitude_um", f"{final['inc'] * 1e6:.5f}",
-                         "chi2_red", f"{final['chi2_red']:.3f}", "n_particules", final["n"],
+                         "chi2_red", f"{final['chi2_red']:.3f}", "facteur_birge", f"{final['birge']:.3f}",
+                         "birge_applique", "oui" if final["birge_applique"] else "non",
+                         "incertitude_avec_birge_um", f"{final['inc_birge'] * 1e6:.5f}", "n_particules", final["n"],
                          "methode", "moyenne des D" if final.get("methode") == "D"
                          else "moyenne ponderee des rayons"])
         wr.writerow(["pistes_exclues_a_la_main", " ".join(map(str, sorted(exclues))) or "aucune"])
         cond = conditions_acquisition(acq)
         wr.writerow(["decalages_L_msd", LAG_MAX])
+        wr.writerow(["vibration_retiree", "oui" if INFO_VIBRATION.get("vibration") else "non",
+                     "references_vibration", " ".join(map(str, INFO_VIBRATION.get("refs", []))) or "-"])
         wr.writerow(["echelle_um_px", f"{cond['echelle_um']:.5f}", "dt_s", f"{acq['dt']:.5f}",
                      "grossissement", cond["grossissement"]])
     print(f"Exporté : {mp4.name} et {fichier_csv.name} (dans {base.parent})")
@@ -1202,32 +1327,57 @@ def exporter(acq, resultats, final, detections, bornes, chemin, exclues=()):
 
 def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
     """Vidéo annotée en boucle au rythme réel + panneau de résultats.
-    Espace = pause · CLIC sur une bille (vidéo) ou sur un point (graphique des rayons) = exclure / réintégrer
-    la piste · r = réintégrer toutes les pistes · e = exporter MP4 + CSV. Retourne les pistes exclues."""
+    Espace = pause · CLIC sur une bille (vidéo), un point (graphique des rayons) ou une ligne (tableau) = exclure /
+    réintégrer la piste · r = réintégrer toutes les pistes · e = exporter MP4 + CSV ·
+    flèches ◀ ▶ (boutons au-dessus de la vidéo, ou touches ← →) = zoom sur la trajectoire de chaque bille
+    SÉLECTIONNÉE, à tour de rôle, puis retour à la vue d'ensemble. Retourne les pistes exclues."""
+    for cle, touches in (("keymap.back", ("left",)), ("keymap.forward", ("right",))):   # ← → : zoom, pas
+        plt.rcParams[cle] = [t for t in plt.rcParams[cle] if t not in touches]          # l'historique de vue
     frames, n = acq["frames"], len(acq["frames"])
     bornes = contraste(frames[n // 2])
-    s = min(1.0, LARGEUR_AFFICHAGE_MAX / frames.shape[2])
+    H, W = frames.shape[1:]
+    s = min(1.0, LARGEUR_AFFICHAGE_MAX / W)
+    cible = (round(W * s), round(H * s))                    # taille de la vidéo à l'écran (vue d'ensemble et zoom)
     pe, dt = acq["pixel_eff"], acq["dt"]
     par_id = {r["piste"]: r for r in resultats}
-    etat = dict(k=0, exclues=set(), final=rayon_final(pistes_moyenne(resultats)), pause=False)
+    marge = max(12.0, 4 * (sigma_psf or 3.0))               # px natifs autour de la trajectoire zoomée
+    regions = {r["piste"]: region_zoom(r, (H, W), W / H, marge) for r in resultats}
+    # contraste propre à chaque zoom (sinon une bille brillante sature en blanc une fois agrandie)
+    bornes_zoom = {p: contraste_region(frames[n // 2], reg) for p, reg in regions.items()}
+    etat = dict(k=0, exclues=set(), final=rayon_final(pistes_moyenne(resultats)), pause=False, vue=None, birge=False)
+
+    def image(k):
+        p = etat["vue"]
+        if p is None:
+            return composer_image(acq, k, resultats, detections, bornes, s, etat["exclues"])
+        return composer_image(acq, k, resultats, detections, bornes_zoom[p], exclues=etat["exclues"],
+                              region=regions[p], cible=cible, focus=p)
+
+    def ecran_vers_natif(X, Y):
+        """Clic dans la vidéo affichée -> pixel natif; et l'échelle (px affichés par px natif)."""
+        if etat["vue"] is None:
+            return (X + 0.5) / s - 0.5, (Y + 0.5) / s - 0.5, s
+        x0, y0, x1, y1 = regions[etat["vue"]]
+        sx, sy = cible[0] / (x1 - x0), cible[1] / (y1 - y0)
+        return x0 + (X + 0.5) / sx - 0.5, y0 + (Y + 0.5) / sy - 0.5, sx
 
     fig = plt.figure(figsize=(17, 9.5))
     # La rangée du tableau grandit avec le nombre de pistes (≈ 12 lignes tiennent dans la hauteur de base)
     h_tableau = min(1.4, 0.8 * max(1.0, (len(resultats) + 1) / 12))   # plafonné : la police rapetisse ensuite
-    gs = fig.add_gridspec(3, 2, width_ratios=[2.1, 1], height_ratios=[0.6, 1.6, h_tableau])
+    gs = fig.add_gridspec(3, 2, width_ratios=[2.1, 1], height_ratios=[0.75, 1.6, h_tableau])
     ax_v = fig.add_subplot(gs[0:2, 0])
     ax_t = fig.add_subplot(gs[2, 0])
     ax_c = fig.add_subplot(gs[0, 1])
     ax_m = fig.add_subplot(gs[1, 1])
     ax_r = fig.add_subplot(gs[2, 1])
-    im = ax_v.imshow(composer_image(acq, 0, resultats, detections, bornes, s))
+    im = ax_v.imshow(image(0))
     ax_v.set_axis_off()
 
     # --- MSD et ajustement linéaire, une couleur par piste (dessiné une fois; style mis à jour)
     lignes_msd = {}
     for r in resultats:
         col = couleur_mpl(r["piste"])
-        pos = r["pos_px"] * pe
+        pos = r.get("pos_msd", r["pos_px"]) * pe        # positions du calcul (vibration retirée si demandé)
         lags, msd = msd_temporel(pos, LAG_MAX)
         ok = np.isfinite(msd)
         D, off = ajuste_msd(pos, dt, LAG_MAX)
@@ -1248,25 +1398,20 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
         ax_c.clear()
         ax_c.set_axis_off()
         ax_c.add_patch(plt.Rectangle((0, 0), 1, 1, transform=ax_c.transAxes, color="#eef3f8", zorder=0))
-        ax_c.text(0.04, 0.85, "RAYON MOYEN DES PARTICULES", fontsize=9, fontweight="bold", transform=ax_c.transAxes)
+        ax_c.text(0.04, 0.95, "RAYON MOYEN DES PARTICULES", fontsize=9, fontweight="bold", va="top",
+                  transform=ax_c.transAxes)
         if final:
-            ax_c.text(0.04, 0.48, texte_rayon(final), fontsize=19,
+            ax_c.text(0.04, 0.70, texte_rayon(final), fontsize=17, va="center",
                       fontweight="bold", color="#0b3d6b", transform=ax_c.transAxes)
-            if final.get("methode") == "D":
-                details = (f"{final['n']} particule(s) : moyenne des D = {final['D_moy'] * 1e12:.4f} µm²/s, "
-                           f"puis Stokes-Einstein (au moins un D <= 0)"
-                           f"\nincertitude = dispersion des D (écart-type / √n)")
-            else:
-                chi = f"  ·  χ²réd = {final['chi2_red']:.2f}" if np.isfinite(final["chi2_red"]) else ""
-                details = (f"{final['n']} particule(s){chi}"
-                           + (f"  ·  σ_PSF = {sigma_psf:.2f} px" if sigma_psf else "")
-                           + f"\nσ_PSF (localisation) = {final['inc_psf'] * 1e6:.3f} µm ⊕ "
-                             f"σ_stat = {final['inc_stat'] * 1e6:.3f} µm")
+            details = (f"{final['n']} particule(s)  ·  D moyen = {final['D_moy'] * 1e12:.4f} µm²/s → Stokes-Einstein"
+                       + (f"\nσ_PSF (localisation) = {final['inc_psf'] * 1e6:.3f} µm ⊕ σ_stat = "
+                          f"{final['inc_stat'] * 1e6:.3f} µm" if np.isfinite(final["a"]) else "")
+                       + "\n" + texte_birge(final) + "  [b = Birge oui/non]")
         else:
-            ax_c.text(0.04, 0.48, "Aucune piste dans la moyenne", fontsize=14, transform=ax_c.transAxes)
+            ax_c.text(0.04, 0.70, "Aucune piste dans la moyenne", fontsize=14, va="center", transform=ax_c.transAxes)
             details = ""
         details += f"\nMSD sur L = {LAG_MAX} décalage(s) · exclues à la main : {sorted(exclues) if exclues else 'aucune'}"
-        ax_c.text(0.04, 0.05, details, fontsize=8.5, transform=ax_c.transAxes)
+        ax_c.text(0.04, 0.04, details, fontsize=8, va="bottom", linespacing=1.25, transform=ax_c.transAxes)
 
         ax_r.clear()
         tracer_rayons(ax_r, resultats, final, exclues)
@@ -1307,21 +1452,25 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
     def maj(k):
         etat["k"] = k
         exclues = etat["exclues"]
-        im.set_data(composer_image(acq, k, resultats, detections, bornes, s, exclues))
+        im.set_data(image(k))
         slot = acq["indices"][k]
         presents = [r for r in resultats
                     if 0 <= slot - r["f0"] < len(r["pos_px"]) and np.isfinite(r["pos_px"][slot - r["f0"], 0])]
         ids_presents = {r["piste"] for r in presents}
+        vue = etat["vue"]
         for p, (pts, fit, col) in lignes_msd.items():
             for l in (pts, fit):
-                l.set_alpha(1.0 if p in ids_presents else 0.2)
-        finis = [r for r in presents if np.isfinite(r["a"])]
+                l.set_alpha((1.0 if p == vue else 0.12) if vue is not None else (1.0 if p in ids_presents else 0.2))
+        finis = [r for r in presents if np.isfinite(r["a"]) and (vue is None or r["piste"] == vue)]
         etat["actifs"].set_offsets(np.column_stack([[r["piste"] for r in finis], [r["a"] * 1e6 for r in finis]])
                                    if finis else np.empty((0, 2)))
         perdues = int(acq["indices"][-1] + 1 - n)
-        fig.suptitle(f"{chemin.name} — image {k + 1}/{n}   {len(presents)} bille(s) suivie(s)"
+        fig.suptitle(y=0.995, t=f"{chemin.name} — image {k + 1}/{n}   "
+                     + (f"ZOOM sur la piste {vue}" if vue is not None else f"{len(presents)} bille(s) suivie(s)")
                      + (f"   ({perdues} images perdues à l'acquisition)" if perdues else "")
-                     + "      [espace = pause · clic (vidéo, rayons ou tableau) = exclure/réintégrer · r = tout réintégrer · e = exporter]",
+                     + ("   [vibration retirée]" if INFO_VIBRATION.get("vibration") else "")
+                     + "      [espace = pause · ◀ ▶ ou ← → = zoom · clic (vidéo, rayons, tableau) = exclure/réintégrer"
+                       " · b = Birge · r = tout réintégrer · e = exporter]",
                      fontsize=10)
         return []
 
@@ -1329,7 +1478,10 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
         for p in pids:
             etat["exclues"] ^= {p}
             print(f"Piste {p} {'exclue' if p in etat['exclues'] else 'réintégrée'}")
-        etat["final"] = rayon_final(pistes_moyenne(resultats, etat["exclues"]))
+        recalculer()
+
+    def recalculer():
+        etat["final"] = rayon_final(pistes_moyenne(resultats, etat["exclues"]), etat["birge"])
         print("  -> " + texte_final(etat["final"]), flush=True)
         dessiner_panneaux()
         maj(etat["k"])
@@ -1356,13 +1508,14 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
             return
         if evt.inaxes is ax_v:                           # bille la plus proche dans l'image affichée
             slot = acq["indices"][etat["k"]]
-            x, y = evt.xdata / s, evt.ydata / s
-            meilleur, d_min = None, 25 / s
+            x, y, echelle = ecran_vers_natif(evt.xdata, evt.ydata)
+            meilleur, d_min = None, np.inf
             for r in resultats:
                 j = slot - r["f0"]
                 if 0 <= j < len(r["pos_px"]) and np.isfinite(r["pos_px"][j, 0]):
                     d = np.hypot(r["pos_px"][j, 0] - x, r["pos_px"][j, 1] - y)
-                    if d < d_min:
+                    # accepté à moins de 25 px d'écran OU à l'intérieur du cercle de 2σ (utile en zoom)
+                    if d < max(25 / echelle, 2.5 * r["sig_px"][j]) and d < d_min:
                         meilleur, d_min = r["piste"], d
             if meilleur is not None:
                 basculer([meilleur])
@@ -1373,10 +1526,33 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
                 if abs(p - evt.xdata) < 0.5:
                     basculer([p])
 
+    def naviguer(sens):
+        """Vue d'ensemble -> zoom sur chaque bille sélectionnée (dans l'ordre des numéros) -> vue d'ensemble."""
+        ordre = [None] + [r["piste"] for r in resultats if r["piste"] not in etat["exclues"]]
+        vue = etat["vue"]
+        if vue in ordre:
+            i = ordre.index(vue)
+        else:                                           # bille zoomée exclue entre-temps : on repart d'à côté
+            i = max([j for j, q in enumerate(ordre) if q is not None and q < vue] or [0])
+        etat["vue"] = ordre[(i + sens) % len(ordre)]
+        n_sel = len(ordre) - 1
+        etat["texte_vue"].set_text("Vue d'ensemble" if etat["vue"] is None else
+                                   f"Zoom : piste {etat['vue']} ({ordre.index(etat['vue'])}/{n_sel} sélectionnées)")
+        maj(etat["k"])
+        fig.canvas.draw_idle()
+
     def touche(evt):
-        if evt.key == " ":
+        if evt.key == "right":
+            naviguer(+1)
+        elif evt.key == "left":
+            naviguer(-1)
+        elif evt.key == " ":
             (anim.resume if etat["pause"] else anim.pause)()
             etat["pause"] = not etat["pause"]
+        elif evt.key == "b":
+            etat["birge"] = not etat["birge"]
+            print(f"Facteur de Birge {'appliqué' if etat['birge'] else 'non appliqué'}")
+            recalculer()
         elif evt.key == "r" and etat["exclues"]:
             basculer(sorted(etat["exclues"]))
         elif evt.key == "e":
@@ -1387,7 +1563,17 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None):
                 anim.resume()
 
     dessiner_panneaux()
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    # Flèches de zoom, juste au-dessus du coin gauche de la vidéo
+    bb = ax_v.get_position()
+    ax_g = fig.add_axes([bb.x0, bb.y1 + 0.004, 0.028, 0.032])
+    ax_d = fig.add_axes([bb.x0 + 0.031, bb.y1 + 0.004, 0.028, 0.032])
+    bouton_g, bouton_d = Button(ax_g, "◀"), Button(ax_d, "▶")
+    bouton_g.on_clicked(lambda _: naviguer(-1))
+    bouton_d.on_clicked(lambda _: naviguer(+1))
+    etat["texte_vue"] = fig.text(bb.x0 + 0.066, bb.y1 + 0.02, "Vue d'ensemble", va="center", fontsize=10,
+                                 fontweight="bold")
+    fig._boutons = (bouton_g, bouton_d)     # garde une référence, sinon les boutons ne répondent plus
     anim = FuncAnimation(fig, maj, frames=n, interval=1000 * dt, repeat=True)
     fig.canvas.mpl_connect("key_press_event", touche)
     fig.canvas.mpl_connect("button_press_event", clic)
@@ -1467,6 +1653,19 @@ def choisir_lag():
         print("  Taper un entier de 1 à 5.")
 
 
+def choisir_vibration():
+    """Retirer (o) ou non (N, défaut) le mouvement commun mesuré sur les billes immobiles."""
+    print("Vibration : le mouvement commun à toutes les billes (vibration de la platine, dérive) peut être mesuré sur\n"
+          "  les billes immobiles et retiré avant le MSD. Les billes immobiles servent alors de référence.")
+    while True:
+        rep = input("Retirer le mouvement commun ? (o/N) : ").strip().lower()
+        if rep in ("", "n", "non"):
+            return False
+        if rep in ("o", "oui", "y"):
+            return True
+        print("  Taper o ou n.")
+
+
 def choisir_analyse():
     print("Analyses :\n  1. classique (une image + détections, puis trajectoires et rayons)\n"
           "  2. dynamique (vidéo en boucle avec les billes suivies, cercles et rayons)")
@@ -1485,6 +1684,7 @@ if __name__ == "__main__":
     chemin = choisir_fichier()
     analyse = choisir_analyse()
     LAG_MAX = choisir_lag()          # global du module : utilisé par l'ajustement, l'affichage et l'export
+    INFO_VIBRATION["vibration"] = choisir_vibration()
 
     fps_sans_json = None
     if not chemin_json(chemin).exists() and chemin.suffix.lower() not in EXTENSIONS_VIDEO:
@@ -1545,7 +1745,20 @@ if __name__ == "__main__":
     detections = localiser_toutes_frames(frames, sigma_psf, **kw_det)
     pistes = lier_trajectoires(detections, acq["indices"], dist_max_px=dist_max_px, trou_max=TROU_MAX)
     pistes_tab = pistes_en_tableaux(pistes, n_min=N_MIN)
-    resultats = analyser_pistes(pistes_tab, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX)
+    resultats = analyser_pistes(pistes_tab, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX, t_exp=acq["t_exp"])
+    if INFO_VIBRATION["vibration"] and resultats:
+        corrigees, refs, ec = corriger_vibration(pistes_tab, resultats, int(acq["indices"][-1]) + 1)
+        if corrigees is None:
+            print(f"Vibration NON retirée : il faut au moins 2 billes immobiles de référence ({len(refs)} trouvée(s)).")
+            INFO_VIBRATION["vibration"] = False
+        else:
+            INFO_VIBRATION["refs"] = refs
+            print(f"Vibration retirée : références = pistes {refs} (billes immobiles) · mouvement commun entre images : "
+                  f"{ec * pixel_eff * 1e9:.0f} nm (écart type)")
+            corr = analyser_pistes(corrigees, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX, t_exp=acq["t_exp"])
+            for r, rc, t in zip(resultats, corr, corrigees):
+                rc.update(pos_px=r["pos_px"], pos_msd=t["pos_px"])     # affichage : positions réelles dans l'image
+            resultats = corr
     if not resultats:
         print(f"Aucune piste d'au moins {N_MIN} positions : impossible de calculer un rayon.")
     imprimer_resultats(resultats, rayon_final(pistes_moyenne(resultats)))
@@ -1554,7 +1767,7 @@ if __name__ == "__main__":
         if resultats:
             afficher_resultats(frames, resultats, rayon_final(pistes_moyenne(resultats)))
             # Exclusion à la main, une fois la figure regardée (et fermée)
-            exclues, final = choisir_exclusions(resultats)
+            exclues, final, _ = choisir_exclusions(resultats)
             if exclues:
                 afficher_resultats(frames, resultats, final, exclues)
     else:
