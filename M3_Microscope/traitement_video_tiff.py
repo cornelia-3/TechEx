@@ -637,20 +637,34 @@ def mouvement_commun(pistes_tab, refs, n_creneaux, sauf=None):
     return c
 
 
-def corriger_vibration(pistes_tab, resultats, n_creneaux):
+def corriger_vibration(pistes_tab, resultats, n_creneaux, analyser=None, iter_max=10):
     """Retire de chaque piste le mouvement commun mesuré sur les billes immobiles (colonne « Immobile ? »).
-    Retourne (pistes corrigées, références, écart type du mouvement commun en px) ou (None, refs, nan)
-    s'il y a moins de 2 billes immobiles."""
+    Choix ITÉRATIF des références : une bille marquée immobile avant correction peut se révéler mobile une fois
+    la vibration retirée (sa lente diffusion était masquée). On recalcule alors le mouvement commun avec les
+    seules billes encore immobiles, et on répète jusqu'à ce que la liste ne change plus (ou iter_max; si elle
+    tourne en rond, on garde la dernière). analyser(pistes) -> résultats (sans lui : une seule passe).
+    Retourne (pistes corrigées, références (numéros), écart type du mouvement commun en px, résultats corrigés
+    ou None, nombre de passes) ; pistes corrigées = None s'il y a moins de 2 billes immobiles."""
     refs = [i for i, r in enumerate(resultats) if r["immobile"]]           # indices dans pistes_tab
-    noms = [resultats[i]["piste"] for i in refs]
-    if len(refs) < 2:
-        return None, noms, np.nan
-    c_tous = mouvement_commun(pistes_tab, refs, n_creneaux)
-    corrigees = []
-    for i, t in enumerate(pistes_tab):
-        c = mouvement_commun(pistes_tab, refs, n_creneaux, sauf=i) if i in refs else c_tous
-        corrigees.append(dict(t, pos_px=t["pos_px"] - c[t["f0"]:t["f0"] + len(t["pos_px"])]))
-    return corrigees, noms, float(np.std(np.diff(c_tous, axis=0)))
+    vus, corr, n_passes = set(), None, 0
+    while True:
+        if len(refs) < 2:
+            return None, [resultats[i]["piste"] for i in refs], np.nan, None, n_passes
+        vus.add(tuple(refs))
+        c_tous = mouvement_commun(pistes_tab, refs, n_creneaux)
+        corrigees = []
+        for i, t in enumerate(pistes_tab):
+            c = mouvement_commun(pistes_tab, refs, n_creneaux, sauf=i) if i in refs else c_tous
+            corrigees.append(dict(t, pos_px=t["pos_px"] - c[t["f0"]:t["f0"] + len(t["pos_px"])]))
+        n_passes += 1
+        if analyser is None:
+            break
+        corr = analyser(corrigees)
+        nouveaux = [i for i, r in enumerate(corr) if r["immobile"]]
+        if nouveaux == refs or tuple(nouveaux) in vus or n_passes >= iter_max or len(nouveaux) < 2:
+            break
+        refs = nouveaux
+    return corrigees, [resultats[i]["piste"] for i in refs], float(np.std(np.diff(c_tous, axis=0))), corr, n_passes
 
 
 #############################################################################################################
@@ -1747,15 +1761,16 @@ if __name__ == "__main__":
     pistes_tab = pistes_en_tableaux(pistes, n_min=N_MIN)
     resultats = analyser_pistes(pistes_tab, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX, t_exp=acq["t_exp"])
     if INFO_VIBRATION["vibration"] and resultats:
-        corrigees, refs, ec = corriger_vibration(pistes_tab, resultats, int(acq["indices"][-1]) + 1)
+        corrigees, refs, ec, corr, n_passes = corriger_vibration(
+            pistes_tab, resultats, int(acq["indices"][-1]) + 1,
+            analyser=lambda p: analyser_pistes(p, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX, t_exp=acq["t_exp"]))
         if corrigees is None:
             print(f"Vibration NON retirée : il faut au moins 2 billes immobiles de référence ({len(refs)} trouvée(s)).")
             INFO_VIBRATION["vibration"] = False
         else:
             INFO_VIBRATION["refs"] = refs
-            print(f"Vibration retirée : références = pistes {refs} (billes immobiles) · mouvement commun entre images : "
-                  f"{ec * pixel_eff * 1e9:.0f} nm (écart type)")
-            corr = analyser_pistes(corrigees, dt, pixel_eff=pixel_eff, lag_max=LAG_MAX, t_exp=acq["t_exp"])
+            print(f"Vibration retirée : références = pistes {refs} (billes immobiles, choisies en {n_passes} passe(s)) "
+                  f"· mouvement commun entre images : {ec * pixel_eff * 1e9:.0f} nm (écart type)")
             for r, rc, t in zip(resultats, corr, corrigees):
                 rc.update(pos_px=r["pos_px"], pos_msd=t["pos_px"])     # affichage : positions réelles dans l'image
             resultats = corr
