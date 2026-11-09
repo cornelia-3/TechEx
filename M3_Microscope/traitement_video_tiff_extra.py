@@ -93,6 +93,7 @@ TAILLE_PIXEL = 1.55e-6     # m
 REDUCTION = 4056 / 640     # nbr pixels capteur / nbr pixels image (mp4 de 640 px de large)
 PIXEL_EFF = TAILLE_PIXEL * REDUCTION / GROSSISSEMENT        # m/pixel dans le plan objet
 FPS_DEFAUT = 30.0
+MODE_TEST = False          # analyse 3 (test en conditions réelles) : carte réduite au rayon, tableau défilable
 
 # --- EXTRA : liaison protégée et vibration
 SEUIL_AMBIGU = 4.6         # échange de deux billes « presque aussi probable » : rapport de vraisemblance < e^4.6 ≈ 100
@@ -1963,6 +1964,14 @@ def exporter(acq, resultats, final, detections, bornes, chemin, exclues=()):
         if (k + 1) % max(1, n // 10) == 0:
             print(f"  export : {k + 1}/{n} images", flush=True)
     video.release()
+    if MODE_TEST:     # vidéo du mandat : chaque image avec temps, échelle et conditions d'acquisition, sans annotations
+        mp4c = mp4.with_name(mp4.name.replace("_annote.mp4", "_conditions.mp4"))
+        video = cv2.VideoWriter(str(mp4c), cv2.VideoWriter_fourcc(*"mp4v"), 1 / acq["dt"], (w, h))
+        vides = [np.empty((0, 2))] * n
+        for k in range(n):
+            video.write(cv2.cvtColor(composer_image(acq, k, [], vides, bornes, 1.0), cv2.COLOR_RGB2BGR))
+        video.release()
+        print(f"  vidéo des conditions d'acquisition : {mp4c.name}", flush=True)
 
     fmt = lambda v, f, e: f % (v * e) if np.isfinite(v) else ""
     fichier_csv = base.with_name(base.name + "_extra_analyse.csv")
@@ -1997,6 +2006,22 @@ def exporter(acq, resultats, final, detections, bornes, chemin, exclues=()):
     print(f"Exporté : {mp4.name} et {fichier_csv.name} (dans {base.parent})")
 
 
+def agrandir_fenetre(fig):
+    """Ouvre la fenêtre de l'analyse en plein écran (maximisée) quand le système le permet : vidéo plus grande."""
+    try:
+        fen = fig.canvas.manager.window
+    except AttributeError:
+        return
+    for essai in (lambda: fen.state("zoomed"),                 # TkAgg (Windows)
+                  lambda: fen.attributes("-zoomed", True),     # TkAgg (Linux)
+                  lambda: fen.showMaximized()):                # QtAgg
+        try:
+            essai()
+            return
+        except Exception:
+            pass
+
+
 def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues_depart=()):
     """Vidéo annotée en boucle au rythme réel + panneau de résultats.
     Espace = pause · CLIC sur une bille (vidéo), un point (graphique des rayons) ou une ligne (tableau) = exclure /
@@ -2021,11 +2046,15 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
     etat = dict(k=0, exclues=set(exclues_depart), pause=False, vue=None, birge=False, fusion=None, a_fusionner=None)
     etat["final"] = rayon_final(pistes_moyenne(resultats, etat["exclues"]))
 
+    etat["epure"] = False                   # vue épurée : ni trajectoires, ni cercles, ni numéros
+    vides = [np.empty((0, 2))] * n
+
     def image(k):
         p = etat["vue"]
+        res, det = ([], vides) if etat["epure"] else (resultats, detections)
         if p is None:
-            return composer_image(acq, k, resultats, detections, bornes, s, etat["exclues"])
-        return composer_image(acq, k, resultats, detections, bornes_zoom[p], exclues=etat["exclues"],
+            return composer_image(acq, k, res, det, bornes, s, etat["exclues"])
+        return composer_image(acq, k, res, det, bornes_zoom[p], exclues=etat["exclues"],
                               region=regions[p], cible=cible, focus=p)
 
     def ecran_vers_natif(X, Y):
@@ -2036,10 +2065,15 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         sx, sy = cible[0] / (x1 - x0), cible[1] / (y1 - y0)
         return x0 + (X + 0.5) / sx - 0.5, y0 + (Y + 0.5) / sy - 0.5, sx
 
+    plt.rcParams.update({"font.size": 8, "axes.titlesize": 9, "axes.labelsize": 8, "xtick.labelsize": 7,
+                         "ytick.labelsize": 7, "legend.fontsize": 7, "legend.title_fontsize": 7})
     fig = plt.figure(figsize=(17, 9.5))
-    # La rangée du tableau grandit avec le nombre de pistes (≈ 12 lignes tiennent dans la hauteur de base)
-    h_tableau = min(1.4, 0.8 * max(1.0, (len(resultats) + 1) / 12))   # plafonné : la police rapetisse ensuite
-    gs = fig.add_gridspec(3, 2, width_ratios=[2.1, 1], height_ratios=[0.75, 1.6, h_tableau])
+    agrandir_fenetre(fig)
+    if MODE_TEST:                           # tableau de hauteur fixe (défilable) et carte réduite : vidéo plus grande
+        h_tableau, h_carte = 0.55, 0.4
+    else:                                   # la rangée du tableau grandit avec le nombre de pistes (plafonnée)
+        h_tableau, h_carte = min(1.2, 0.7 * max(1.0, (len(resultats) + 1) / 12)), 0.75
+    gs = fig.add_gridspec(3, 2, width_ratios=[2.4, 1], height_ratios=[h_carte, 1.9, h_tableau])
     ax_v = fig.add_subplot(gs[0:2, 0])
     ax_t = fig.add_subplot(gs[2, 0])
     ax_c = fig.add_subplot(gs[0, 1])
@@ -2062,7 +2096,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                          label=str(r["piste"]))
         lignes_msd[r["piste"]] = (pts, fit, col)
     ax_m.set(xlabel="Délai τ (s)", ylabel="MSD (µm²)",
-             title=f"MSD et ajustement linéaire (Éq. 7) · L = {LAG_MAX} décalage(s)")
+             title=f"MSD et ajustement · L = {LAG_MAX}")
     ax_m.grid(alpha=0.3)
     if resultats:
         ax_m.legend(title="piste", fontsize=7, ncol=2)
@@ -2075,7 +2109,11 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         ax_c.add_patch(plt.Rectangle((0, 0), 1, 1, transform=ax_c.transAxes, color="#eef3f8", zorder=0))
         ax_c.text(0.04, 0.95, "RAYON MOYEN DES PARTICULES", fontsize=9, fontweight="bold", va="top",
                   transform=ax_c.transAxes)
-        if final:
+        if final and MODE_TEST:                 # analyse 3 : seulement la valeur de a et son incertitude
+            ax_c.text(0.04, 0.42, texte_rayon(final), fontsize=20, va="center",
+                      fontweight="bold", color="#0b3d6b", transform=ax_c.transAxes)
+            details = ""
+        elif final:
             ax_c.text(0.04, 0.70, texte_rayon(final), fontsize=17, va="center",
                       fontweight="bold", color="#0b3d6b", transform=ax_c.transAxes)
             details = (f"{final['n']} particule(s)  ·  D moyen = {final['D_moy'] * 1e12:.4f} µm²/s → Stokes-Einstein"
@@ -2086,11 +2124,12 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
             ax_c.text(0.04, 0.70, "Aucune piste dans la moyenne", fontsize=14, va="center", transform=ax_c.transAxes)
             details = ""
         details += f"\nMSD sur L = {LAG_MAX} décalage(s) · exclues à la main : {sorted(exclues) if exclues else 'aucune'}"
-        ax_c.text(0.04, 0.04, details, fontsize=8, va="bottom", linespacing=1.25, transform=ax_c.transAxes)
+        if not MODE_TEST:
+            ax_c.text(0.04, 0.04, details, fontsize=8, va="bottom", linespacing=1.25, transform=ax_c.transAxes)
 
         ax_r.clear()
         tracer_rayons(ax_r, resultats, final, exclues)
-        ax_r.set_title(ax_r.get_title() + "  —  clic = exclure / réintégrer", fontsize=9)
+        ax_r.set_title(ax_r.get_title() + " · clic = exclure", fontsize=8)
         ax_r.grid(alpha=0.3)
         etat["actifs"] = ax_r.scatter([], [], s=200, facecolors="none", edgecolors="red", lw=1.5, zorder=5)
 
@@ -2112,18 +2151,38 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                          f(r["D"] / r["sigma_D0"], 1, 1) if r["sigma_D0"] > 0 else "—", f(r["sigma_exp"], 1e9, 0),
                          f(r["a"], 1e6, 3) if np.isfinite(r["a"]) else "∞", f(r["inc_psf"], 1e6, 3),
                          f(r["inc_stat"], 1e6, 3), f(r["inc"], 1e6, 3)] for r in resultats]
+            hauteur_pt = ax_t.get_position().height * fig.get_figheight() * 72    # hauteur de la zone (points)
+            largeur_pt = ax_t.get_position().width * fig.get_figwidth() * 72
+            # largeur de chaque colonne selon son texte le plus long; police assez petite pour que tout tienne
+            n_car = [max([len(str(tetes[j]))] + [len(str(c[j])) for c in cellules]) + 2 for j in range(len(tetes))]
+            police = min(8.5 if MODE_TEST else 8.0, largeur_pt / (0.58 * sum(n_car)))
+            deb, visibles = 0, resultats
+            if MODE_TEST:                       # au moins 5 lignes visibles (police réduite au besoin), le reste défile
+                police = max(4.0, min(police, 0.6 * hauteur_pt / 6))
+                n_vis = max(5, int(0.6 * hauteur_pt / police) - 1)
+                deb = int(np.clip(etat.get("deb", 0), 0, max(0, len(resultats) - n_vis)))
+                etat["deb"] = deb
+                visibles = resultats[deb:deb + n_vis]
+                cellules = cellules[deb:deb + n_vis]
+            else:
+                police = max(4.0, min(police, 0.6 * hauteur_pt / (len(resultats) + 1)))
+            etat["tab_deb"] = deb
             # bbox = toute la zone du tableau : les lignes se partagent la hauteur disponible, rien ne déborde
             tab = ax_t.table(cellText=cellules, colLabels=tetes, bbox=[0, 0, 1, 1], cellLoc="center")
             etat["tab"] = tab
             tab.auto_set_font_size(False)
-            hauteur_pt = ax_t.get_position().height * fig.get_figheight() * 72    # hauteur de la zone (points)
-            tab.set_fontsize(max(4.0, min(8.0, 0.6 * hauteur_pt / (len(resultats) + 1))))
-            for i, r in enumerate(resultats, 1):
+            tab.set_fontsize(police)
+            for (_, j), case in tab.get_celld().items():
+                case.set_width(n_car[j])           # relatif : le tableau est remis à l'échelle dans sa zone
+            for i, r in enumerate(visibles, 1):
                 if r["piste"] in exclues:
                     for j in range(len(tetes)):
                         tab[i, j].get_text().set_color("0.6")
                 else:
                     tab[i, 0].set_facecolor(couleur_mpl(r["piste"]) + (0.45,))
+            if len(visibles) < len(resultats):
+                ax_t.text(1.0, 1.01, f"lignes {deb + 1}–{deb + len(visibles)} sur {len(resultats)}  ·  molette ou ↑ ↓ "
+                          "pour défiler", transform=ax_t.transAxes, ha="right", va="bottom", fontsize=8, color="0.4")
 
     def maj(k):
         etat["k"] = k
@@ -2145,9 +2204,9 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                      + (f"ZOOM sur la piste {vue}" if vue is not None else f"{len(presents)} bille(s) suivie(s)")
                      + (f"   ({perdues} images perdues à l'acquisition)" if perdues else "")
                      + ("   [vibration retirée]" if INFO_EXTRA.get("vibration") else "")
-                     + "      [espace = pause · ◀ ▶ ou ← → = zoom · clic (vidéo, rayons, tableau) = exclure/réintégrer"
-                       " · g = fusionner des pistes · b = Birge · r = tout réintégrer · e = exporter]",
-                     fontsize=10)
+                     + ("" if MODE_TEST else "\n[espace = pause · ◀ ▶ ou ← → = zoom · a = épuré · clic (vidéo, rayons, tableau) = exclure/réintégrer"
+                       " · g = fusionner des pistes · b = Birge · r = tout réintégrer · e = exporter]"),
+                     fontsize=8.5)
         return []
 
     def basculer(pids):
@@ -2177,7 +2236,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
             return None
         for (ligne, _), case in tab.get_celld().items():
             if ligne >= 1 and case.contains(evt)[0]:
-                return resultats[ligne - 1]["piste"]
+                return resultats[etat.get("tab_deb", 0) + ligne - 1]["piste"]
         return None
 
     def clic(evt):
@@ -2224,8 +2283,21 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         maj(etat["k"])
         fig.canvas.draw_idle()
 
+    def defiler_tableau(pas):
+        etat["deb"] = etat.get("deb", 0) + pas
+        dessiner_panneaux()
+        fig.canvas.draw_idle()
+
+    def molette(evt):
+        if MODE_TEST and evt.inaxes is ax_t:
+            defiler_tableau(-1 if evt.button == "up" else 1)
+
     def touche(evt):
-        if evt.key == "right":
+        if evt.key == "a":
+            etat["basculer_epure"]()
+        elif evt.key in ("up", "down") and MODE_TEST:
+            defiler_tableau(-1 if evt.key == "up" else 1)
+        elif evt.key == "right":
             naviguer(+1)
         elif evt.key == "left":
             naviguer(-1)
@@ -2260,22 +2332,45 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                 anim.resume()
 
     dessiner_panneaux()
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    # Flèches de zoom, juste au-dessus du coin gauche de la vidéo
-    bb = ax_v.get_position()
-    ax_g = fig.add_axes([bb.x0, bb.y1 + 0.004, 0.028, 0.032])
-    ax_d = fig.add_axes([bb.x0 + 0.031, bb.y1 + 0.004, 0.028, 0.032])
+    ax_g, ax_d, ax_e = fig.add_axes([0, 0, 0.01, 0.01]), fig.add_axes([0, 0, 0.01, 0.01]), fig.add_axes([0, 0, 0.01, 0.01])
     bouton_g, bouton_d = Button(ax_g, "◀"), Button(ax_d, "▶")
+    bouton_e = Button(ax_e, "Épuré : non")
     bouton_g.on_clicked(lambda _: naviguer(-1))
     bouton_d.on_clicked(lambda _: naviguer(+1))
-    etat["texte_vue"] = fig.text(bb.x0 + 0.066, bb.y1 + 0.02, "Vue d'ensemble", va="center", fontsize=10,
-                                 fontweight="bold")
-    etat["texte_fusion"] = fig.text(bb.x0 + 0.30, bb.y1 + 0.02, "", va="center", fontsize=10, fontweight="bold",
-                                    color="tab:red")
-    fig._boutons = (bouton_g, bouton_d)     # garde une référence, sinon les boutons ne répondent plus
+
+    def basculer_epure(_=None):
+        etat["epure"] = not etat["epure"]
+        bouton_e.label.set_text("Épuré : oui" if etat["epure"] else "Épuré : non")
+        maj(etat["k"])
+        fig.canvas.draw_idle()
+
+    bouton_e.on_clicked(basculer_epure)
+    etat["basculer_epure"] = basculer_epure
+    etat["texte_vue"] = fig.text(0, 0, "Vue d'ensemble", va="center", fontsize=10, fontweight="bold")
+    etat["texte_fusion"] = fig.text(0, 0, "", va="center", fontsize=10, fontweight="bold", color="tab:red")
+
+    def mise_en_page(_=None):
+        """Positions calculées une fois, à la taille nominale de la figure : en plein écran, les proportions
+        sont gardées (la vidéo grandit avec la fenêtre). Le tableau, lui, est recalculé à chaque redimensionnement."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fig.tight_layout(rect=(0, 0.02, 1, 0.91), h_pad=2.2, w_pad=2.5)
+        bb = ax_v.get_position()
+        hb = 0.03
+        ax_g.set_position([bb.x0, bb.y1 + 0.004, 0.028, hb])
+        ax_d.set_position([bb.x0 + 0.031, bb.y1 + 0.004, 0.028, hb])
+        ax_e.set_position([bb.x1 - 0.085, bb.y1 + 0.004, 0.085, hb])
+        etat["texte_vue"].set_position((bb.x0 + 0.066, bb.y1 + 0.02))
+        etat["texte_fusion"].set_position((bb.x0 + 0.30, bb.y1 + 0.02))
+        dessiner_panneaux()
+
+    mise_en_page()
+    fig.canvas.mpl_connect("resize_event", lambda e: (dessiner_panneaux(), fig.canvas.draw_idle()))
+    fig._boutons = (bouton_g, bouton_d, bouton_e)     # garde une référence, sinon les boutons ne répondent plus
     anim = FuncAnimation(fig, maj, frames=n, interval=1000 * dt, repeat=True)
     fig.canvas.mpl_connect("key_press_event", touche)
     fig.canvas.mpl_connect("button_press_event", clic)
+    fig.canvas.mpl_connect("scroll_event", molette)
     fig._anim = anim                # garde une référence, sinon l'animation s'arrête
     plt.show()
     if etat["a_fusionner"]:
@@ -2308,7 +2403,7 @@ def lettre_option(p):
 
 def choisir_fichier(dossier=DOSSIER_DONNEES):
     candidats = sorted(p for p in dossier.iterdir()
-                       if not p.stem.endswith("_annote")                 # vidéos exportées par l'analyse 2
+                       if not p.stem.endswith(("_annote", "_conditions"))                 # vidéos exportées par l'analyse 2
                        and p.suffix.lower() in EXTENSIONS_TIFF | EXTENSIONS_VIDEO
                        or (p.is_dir() and any(q.suffix.lower() in EXTENSIONS_TIFF | {".png"}
                                               for q in p.iterdir())))
@@ -2369,12 +2464,13 @@ def choisir_vibration():
 
 def choisir_analyse():
     print("Analyses :\n  1. classique (une image + détections, puis trajectoires et rayons)\n"
-          "  2. dynamique (vidéo en boucle avec les billes suivies, cercles et rayons)")
+          "  2. dynamique (vidéo en boucle avec les billes suivies, cercles et rayons)\n"
+          "  3. test en conditions réelles (comme 2, présentation épurée : rayon moyen seul, tableau défilable)")
     while True:
-        rep = input("Analyse (1 ou 2) : ").strip()
-        if rep in ("1", "2"):
+        rep = input("Analyse (1, 2 ou 3) : ").strip()
+        if rep in ("1", "2", "3"):
             return int(rep)
-        print("  Taper 1 ou 2.")
+        print("  Taper 1, 2 ou 3.")
 
 
 #############################################################################################################
@@ -2384,6 +2480,7 @@ def choisir_analyse():
 if __name__ == "__main__":
     chemin = choisir_fichier()
     analyse = choisir_analyse()
+    MODE_TEST = analyse == 3       # global du module : présentation de l'analyse 3
     LAG_MAX = choisir_lag()          # global du module : utilisé par l'ajustement, l'affichage et l'export
     INFO_EXTRA["vibration"] = choisir_vibration()
 

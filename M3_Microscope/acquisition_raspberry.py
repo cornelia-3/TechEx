@@ -14,7 +14,11 @@ Au lancement, deux choix dans le terminal :
 Somme 2x2 du Bayer : chaque carré B G / G R du filtre coloré devient un seul pixel gris
 (valeurs 0 à 4 x 4095 = 16 380). Plus de damier, 4x moins de données, environ 2x moins de bruit.
 
-Le direct affiche exactement les images enregistrées (mêmes pixels). Touches dans la fenêtre :
+Le direct affiche exactement les images enregistrées (mêmes pixels). En haut à gauche de la fenêtre :
+temps écoulé depuis le début de la séquence (s), échelle (µm/pixel), grossissement (20X et 40X : valeur
+ÉTALONNÉE avec la règle), temps d'exposition, fréquence d'acquisition, profondeur de bit, et la saturation
+(part des pixels BRUTS du capteur au maximum 4095, avant la somme 2x2; doit rester à 0 %).
+Touches dans la fenêtre :
     Espace ou Entrée : démarrer / arrêter l'enregistrement
     c : contraste automatique <-> échelle fixe (12 bits, ou 0-16 380 après la somme 2x2)
     z : zoom 1:1 au centre (pour la mise au point)
@@ -44,6 +48,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from picamera2 import Picamera2
 
 try:
@@ -59,6 +64,11 @@ FRACTION_RAM = 0.75                      # part de la RAM libre qu'on s'autorise
 LIVE_PENDANT_ENREGISTREMENT = True       # False = direct figé pendant l'enregistrement (si la Pi ne suit pas)
 LARGEUR_FENETRE = 1000                   # largeur d'affichage du direct (px d'écran)
 GROSSISSEMENT_DEFAUT = 20
+# Grossissements RÉELS mesurés avec la règle graduée (traitement_video_tiff.py, photos regle20x/regle40x).
+# Ils remplacent la valeur nominale pour l'échelle affichée; les autres objectifs gardent la valeur nominale.
+GROSSISSEMENT_ETALONNE = {20: 16.566, 40: 33.507}
+NIVEAU_SATURATION = 4095                 # valeur maximale d'un pixel brut (12 bits)
+PROFONDEUR_BITS = 12
 DOSSIER_SORTIE = Path.cwd()
 
 PLEINE = (4056, 3040)
@@ -110,6 +120,14 @@ def choisir_nom():
     if rep and propre != rep:
         print(f"  Nom ajusté : {propre}")
     return propre or "acq"
+
+
+def grossissement_reel(g):
+    """(grossissement utilisé pour l'échelle, texte affiché)."""
+    if g in GROSSISSEMENT_ETALONNE:
+        m = GROSSISSEMENT_ETALONNE[g]
+        return m, f"{m:.2f}X (étalonné, objectif {g}X)"
+    return float(g), f"{g}X (nominal)"
 
 
 def choisir_grossissement():
@@ -245,6 +263,7 @@ class Enregistreur:
                         if self.opt["somme2x2"] else "raw Bayer BGGR 12 bits, valeurs 0-4095"),
             "pixel_effectif_capteur_um": PIXEL_UM[self.lettre],
             "pixel_plan_objet_um_nominal": PIXEL_UM[self.lettre] / float(self.grossissement),
+            "grossissement_etalonne": GROSSISSEMENT_ETALONNE.get(self.grossissement),
             **self.consignes,
             "n_images": self.n,
             "fps_reel": round(float(fps), 4) if np.isfinite(fps) else None,
@@ -277,6 +296,12 @@ class Etat:
         self.enregistre = False
         self.ecriture = False
         self.fps = float("nan")
+        self.t0_direct = None         # horodatage capteur (ns) du début du direct
+        self.t0_rec = None            # ... et du début de l'enregistrement en cours
+        self.t_ns = None              # horodatage de la dernière image
+        self.expo_us = None           # temps d'exposition réel de la dernière image (métadonnées)
+        self.saturation = float("nan")   # % des pixels bruts au maximum
+        self.max_brut = 0
         self.quitter = threading.Event()
         self.basculer = threading.Event()
 
@@ -295,9 +320,18 @@ def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consign
             finally:
                 req.release()
 
-            derniers = (derniers + [md.get("SensorTimestamp", time.monotonic_ns())])[-20:]
+            ts = md.get("SensorTimestamp", time.monotonic_ns())
+            derniers = (derniers + [ts])[-20:]
+            mx = int(raw.max())
+            sat = 100.0 * np.count_nonzero(raw >= NIVEAU_SATURATION) / raw.size if mx >= NIVEAU_SATURATION else 0.0
             with etat.verrou:
                 etat.n_capturees += 1
+                if etat.t0_direct is None:
+                    etat.t0_direct = ts
+                if rec is not None and rec.n == 0:
+                    etat.t0_rec = ts                  # première image enregistrée = t = 0 de la séquence
+                etat.t_ns, etat.expo_us = ts, md.get("ExposureTime")
+                etat.saturation, etat.max_brut = sat, mx
                 if len(derniers) > 1:
                     etat.fps = 1e9 * (len(derniers) - 1) / (derniers[-1] - derniers[0])
                 if rec is None or LIVE_PENDANT_ENREGISTREMENT:
@@ -346,7 +380,7 @@ def boucle_camera(picam2, etat, lettre, opt, mode, forme, grossissement, consign
 
 def _arreter(rec, etat):
     with etat.verrou:
-        etat.enregistre, etat.ecriture = False, True
+        etat.enregistre, etat.ecriture, etat.t0_rec = False, True, None
     duree = (rec.stamps[-1] - rec.stamps[0]) / 1e9 if len(rec.stamps) > 1 else 0.0
     print(f"\n■ CAPTURE TERMINÉE : {rec.n} images en {duree:.1f} s. "
           f"Le direct reste figé pendant l'écriture des fichiers.", flush=True)
@@ -397,23 +431,83 @@ def texte(img, s, y, couleur=(255, 255, 255)):
     cv2.putText(img, s, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, couleur, 1, cv2.LINE_AA)
 
 
-def boucle_fenetre(etat, titre, vmax):
+_POLICES = {}
+
+
+def police(taille):
+    """Police TrueType (µ, accents) : DejaVu sur la Pi; sinon la police par défaut de PIL."""
+    if taille not in _POLICES:
+        for nom in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVuSans.ttf", "arial.ttf"):
+            try:
+                _POLICES[taille] = ImageFont.truetype(nom, taille)
+                break
+            except OSError:
+                continue
+        else:
+            _POLICES[taille] = ImageFont.load_default()
+    return _POLICES[taille]
+
+
+def incruster_conditions(vue, lignes, couleurs):
+    """Encadré sombre en haut à gauche avec les lignes de texte (BGR uint8, modifié en place)."""
+    taille = max(13, vue.shape[1] // 55)
+    p = police(taille)
+    mesure = ImageDraw.Draw(Image.new("L", (1, 1)))
+    marge, interl = taille // 2, int(taille * 1.3)
+    larg = int(max(mesure.textlength(l, font=p) for l in lignes)) + 2 * marge
+    haut = len(lignes) * interl + 2 * marge
+    larg, haut = min(larg, vue.shape[1]), min(haut, vue.shape[0])
+    vue[:haut, :larg] = (vue[:haut, :larg] * 0.35).astype(np.uint8)
+    zone = Image.fromarray(np.ascontiguousarray(vue[:haut, :larg, ::-1]))
+    d = ImageDraw.Draw(zone)
+    for i, (l, c) in enumerate(zip(lignes, couleurs)):
+        d.text((marge, marge + i * interl), l, font=p, fill=c)
+    vue[:haut, :larg] = np.asarray(zone)[:, :, ::-1]
+    return haut
+
+
+def lignes_conditions(etat, echelle_um, texte_g, fps, saturation, max_brut, expo_us):
+    """Conditions d'acquisition exigées par le mandat + saturation. Temps : depuis le début de l'enregistrement
+    en cours, sinon depuis le début du direct."""
+    t0 = etat.t0_rec if etat.t0_rec is not None else etat.t0_direct
+    t = (etat.t_ns - t0) / 1e9 if (t0 is not None and etat.t_ns is not None) else 0.0
+    expo = f"{expo_us / 1000:.2f} ms" if expo_us else f"{EXPOSURE_US / 1000:.2f} ms (consigne)"
+    blanc, rouge, vert = (255, 255, 255), (255, 80, 80), (120, 230, 120)
+    lignes = [(f"t = {t:.3f} s" + ("   (enregistrement)" if etat.t0_rec is not None else ""), blanc),
+              (f"Échelle : {echelle_um:.4f} µm/pixel", blanc),
+              (f"Grossissement : {texte_g}", blanc),
+              (f"Temps d'exposition : {expo}", blanc),
+              (f"Fréquence d'acquisition : {fps:.1f} images/s" if np.isfinite(fps)
+               else "Fréquence d'acquisition : (mesure en cours)", blanc),
+              (f"Profondeur de bit : {PROFONDEUR_BITS} bits", blanc),
+              (f"Saturation : {saturation:.2f} %   (max {max_brut}/{NIVEAU_SATURATION})",
+               rouge if saturation > 0 else vert)]
+    return [l for l, _ in lignes], [c for _, c in lignes]
+
+
+def boucle_fenetre(etat, titre, vmax, echelle_um, texte_g):
     auto, zoom = True, False
     while not etat.quitter.is_set():
         with etat.verrou:
             img, n, rec, ecr = etat.image, etat.n_rec, etat.enregistre, etat.ecriture
             fps, n_max = etat.fps, etat.n_max_rec
+            lignes, couleurs = lignes_conditions(etat, echelle_um, texte_g, fps, etat.saturation,
+                                                 etat.max_brut, etat.expo_us)
         if img is not None:
             vue, bas, haut = preparer_affichage(img, vmax, auto, zoom)
             echelle = f"auto {bas:.0f}-{haut:.0f}" if auto else f"fixe 0-{vmax}"
-            texte(vue, f"{fps:.1f} fps   contraste {echelle}{'   zoom 1:1' if zoom else ''}", 22)
+            lignes.append(f"(affichage : contraste {echelle}{', zoom 1:1' if zoom else ''})")
+            couleurs.append((170, 170, 170))
             if rec:
                 total = f"/{n_max}" if n_max else ""
-                fige = "  (direct fige)" if not LIVE_PENDANT_ENREGISTREMENT else ""
-                texte(vue, f"REC  {n}{total}{fige}", 48, (0, 0, 255))
+                fige = "  (direct figé)" if not LIVE_PENDANT_ENREGISTREMENT else ""
+                lignes.append(f"● REC  {n}{total}{fige}")
+                couleurs.append((255, 60, 60))
                 cv2.circle(vue, (vue.shape[1] - 25, 25), 10, (0, 0, 255), -1)
             elif ecr:
-                texte(vue, "Ecriture des fichiers...", 48, (0, 200, 255))
+                lignes.append("Écriture des fichiers...")
+                couleurs.append((255, 200, 0))
+            incruster_conditions(vue, lignes, couleurs)
             cv2.imshow(titre, vue)
         touche = cv2.waitKey(30) & 0xFF
         if touche in (ord("q"), 27):
@@ -433,10 +527,12 @@ def boucle_texte(etat):
     while not etat.quitter.is_set():
         with etat.verrou:
             n, rec, ecr, fps, n_max = etat.n_rec, etat.enregistre, etat.ecriture, etat.fps, etat.n_max_rec
+            sat = etat.saturation
         if rec:
-            print(f"\r● REC {n}{f'/{n_max}' if n_max else ''}   {fps:.1f} fps   ", end="", flush=True)
+            print(f"\r● REC {n}{f'/{n_max}' if n_max else ''}   {fps:.1f} fps   saturation {sat:.2f} %   ",
+                  end="", flush=True)
         elif not ecr:
-            print(f"\r  direct (sans fenêtre)   {fps:.1f} fps   ", end="", flush=True)
+            print(f"\r  direct (sans fenêtre)   {fps:.1f} fps   saturation {sat:.2f} %   ", end="", flush=True)
         time.sleep(1)
 
 
@@ -458,7 +554,10 @@ def main():
     lettre = choisir_option()
     opt = OPTIONS[lettre]
     mode = choisir_mode()
-    grossissement = choisir_grossissement() if mode == "enregistrement" else None
+    grossissement = choisir_grossissement()               # aussi en aperçu : l'échelle est affichée
+    m_reel, texte_g = grossissement_reel(grossissement)
+    echelle_um = PIXEL_UM[lettre] / m_reel
+    print(f"  Grossissement : {texte_g} -> échelle {echelle_um:.4f} µm/pixel")
     nom = choisir_nom() if mode == "enregistrement" else None
 
     if mode == "enregistrement" and opt["format"] == "tif" and tifffile is None:
@@ -523,7 +622,7 @@ def main():
 
     try:
         if fenetre:
-            boucle_fenetre(etat, titre, vmax)
+            boucle_fenetre(etat, titre, vmax, echelle_um, texte_g)
         else:
             boucle_texte(etat)
     except KeyboardInterrupt:
