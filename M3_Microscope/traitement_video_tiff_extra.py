@@ -1379,6 +1379,22 @@ def fit_gauss_local(img, x0, y0, fond, sigma_init):
     return np.array([p[1], p[2], err[1], err[2], p[3]])
 
 
+def retirer_fond_lent(frames, taille_px):
+    """Retire, image par image, le fond lisse à grande échelle (éclairage non uniforme) : ouverture morphologique
+    (taille > tache d'une bille) puis moyenne glissante, calculées sur l'image sous-échantillonnée ×4.
+    Le niveau moyen du fond est conservé (même type entier). Modifie `frames` en place."""
+    q = 4
+    t = max(3, int(taille_px) // q)
+    h, w = frames.shape[1:]
+    for i in range(len(frames)):
+        im = frames[i].astype(np.float32)
+        p = ndi.uniform_filter(ndi.grey_opening(im[::q, ::q], size=(t, t)), t)
+        fond = ndi.zoom(p, (h / p.shape[0], w / p.shape[1]), order=1)[:h, :w]
+        frames[i] = np.clip(im - fond + np.median(fond), 0, np.iinfo(frames.dtype).max if frames.dtype.kind in "ui"
+                            else None).astype(frames.dtype)
+    return frames
+
+
 def estimer_sigma_psf(frames, n_frames_max=30, demi=8, **kw_detection):
     """σ de la PSF (pixels) de CETTE vidéo: médiane des σ ajustés librement sur les pics détectés.
     Retourne (σ médian, dispersion MAD, nombre de PSF ajustées)."""
@@ -2204,7 +2220,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                      + (f"ZOOM sur la piste {vue}" if vue is not None else f"{len(presents)} bille(s) suivie(s)")
                      + (f"   ({perdues} images perdues à l'acquisition)" if perdues else "")
                      + ("   [vibration retirée]" if INFO_EXTRA.get("vibration") else "")
-                     + ("" if MODE_TEST else "\n[espace = pause · ◀ ▶ ou ← → = zoom · a = épuré · clic (vidéo, rayons, tableau) = exclure/réintégrer"
+                     + ("" if MODE_TEST else "\n[espace = pause · ◀ ▶ ou ← → = zoom · a = épuré · clic ou rectangle (vidéo), clic (rayons, tableau) = exclure/réintégrer"
                        " · g = fusionner des pistes · b = Birge · r = tout réintégrer · e = exporter]"),
                      fontsize=8.5)
         return []
@@ -2213,7 +2229,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         if etat["fusion"] is not None:                  # mode fusion : le clic choisit les pistes à regrouper
             for p in pids:
                 etat["fusion"] ^= {p}
-            etat["texte_fusion"].set_text("FUSION : " + (" ".join(map(str, sorted(etat["fusion"]))) or "cliquer les pistes")
+            etat["texte_fusion"].set_text("FUSION : " + (" ".join(map(str, sorted(etat["fusion"]))) or "cliquer ou encadrer les pistes")
                                           + "  (g = fusionner · Échap = annuler)")
             fig.canvas.draw_idle()
             return
@@ -2239,6 +2255,70 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
                 return resultats[etat.get("tab_deb", 0) + ligne - 1]["piste"]
         return None
 
+    def bille_proche(X, Y):
+        """Piste la plus proche d'un clic dans la vidéo affichée (None si aucune assez près)."""
+        slot = acq["indices"][etat["k"]]
+        x, y, echelle = ecran_vers_natif(X, Y)
+        meilleur, d_min = None, np.inf
+        for r in resultats:
+            j = slot - r["f0"]
+            if 0 <= j < len(r["pos_px"]) and np.isfinite(r["pos_px"][j, 0]):
+                d = np.hypot(r["pos_px"][j, 0] - x, r["pos_px"][j, 1] - y)
+                # accepté à moins de 25 px d'écran OU à l'intérieur du cercle de 2σ (utile en zoom)
+                if d < max(25 / echelle, 2.5 * r["sig_px"][j]) and d < d_min:
+                    meilleur, d_min = r["piste"], d
+        return meilleur
+
+    def billes_dans(X0, Y0, X1, Y1):
+        """Pistes présentes à l'image affichée dont la position est dans le rectangle (coordonnées d'écran)."""
+        slot = acq["indices"][etat["k"]]
+        xa, ya, _ = ecran_vers_natif(min(X0, X1), min(Y0, Y1))
+        xb, yb, _ = ecran_vers_natif(max(X0, X1), max(Y0, Y1))
+        dedans = []
+        for r in resultats:
+            j = slot - r["f0"]
+            if 0 <= j < len(r["pos_px"]) and np.isfinite(r["pos_px"][j, 0]):
+                x, y = r["pos_px"][j, :2]
+                if xa <= x <= xb and ya <= y <= yb:
+                    dedans.append(r["piste"])
+        return dedans
+
+    def glisser(evt):
+        if etat.get("glisse") is None or evt.inaxes is not ax_v or evt.xdata is None:
+            return
+        _, _, X0, Y0 = etat["glisse"]
+        etat["rect"].set_bounds(min(X0, evt.xdata), min(Y0, evt.ydata), abs(evt.xdata - X0), abs(evt.ydata - Y0))
+        etat["rect"].set_visible(True)
+        fig.canvas.draw_idle()
+
+    def relacher(evt):
+        g = etat.pop("glisse", None)
+        etat["rect"].set_visible(False)
+        if g is None:
+            return
+        x0, y0, X0, Y0 = g
+        if np.hypot(evt.x - x0, evt.y - y0) < 6:          # pas de glissement : clic simple
+            p = bille_proche(X0, Y0)
+            if p is not None:
+                basculer([p])
+            fig.canvas.draw_idle()
+            return
+        X1 = evt.xdata if evt.inaxes is ax_v and evt.xdata is not None else X0 + etat["rect"].get_width()
+        Y1 = evt.ydata if evt.inaxes is ax_v and evt.ydata is not None else Y0 + etat["rect"].get_height()
+        dedans = billes_dans(X0, Y0, X1, Y1)
+        if not dedans:
+            print("Rectangle : aucune bille à l'image affichée.")
+            fig.canvas.draw_idle()
+            return
+        if etat["fusion"] is not None:                  # mode fusion : on AJOUTE toutes les billes du rectangle
+            etat["fusion"] |= set(dedans)
+            basculer([])
+            return
+        # toutes déjà exclues -> on les réintègre toutes; sinon on les exclut toutes
+        cibles = dedans if all(p in etat["exclues"] for p in dedans) else [p for p in dedans if p not in etat["exclues"]]
+        print(f"Rectangle : {len(dedans)} bille(s) {dedans}")
+        basculer(cibles)
+
     def clic(evt):
         if not resultats or fig.canvas.toolbar is not None and fig.canvas.toolbar.mode:
             return
@@ -2248,19 +2328,11 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
             return
         if evt.xdata is None:
             return
-        if evt.inaxes is ax_v:                           # bille la plus proche dans l'image affichée
-            slot = acq["indices"][etat["k"]]
-            x, y, echelle = ecran_vers_natif(evt.xdata, evt.ydata)
-            meilleur, d_min = None, np.inf
-            for r in resultats:
-                j = slot - r["f0"]
-                if 0 <= j < len(r["pos_px"]) and np.isfinite(r["pos_px"][j, 0]):
-                    d = np.hypot(r["pos_px"][j, 0] - x, r["pos_px"][j, 1] - y)
-                    # accepté à moins de 25 px d'écran OU à l'intérieur du cercle de 2σ (utile en zoom)
-                    if d < max(25 / echelle, 2.5 * r["sig_px"][j]) and d < d_min:
-                        meilleur, d_min = r["piste"], d
-            if meilleur is not None:
-                basculer([meilleur])
+        if evt.inaxes is ax_v:                           # vidéo : clic simple OU rectangle (au relâchement)
+            if evt.button == 1:
+                etat["glisse"] = (evt.x, evt.y, evt.xdata, evt.ydata)
+                etat["rect"].set_bounds(evt.xdata, evt.ydata, 0, 0)
+            return
         elif evt.inaxes is ax_r:                         # point le plus proche (en x = numéro de piste)
             finis = [r["piste"] for r in resultats if np.isfinite(r["a"])]
             if finis:
@@ -2307,7 +2379,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         elif evt.key == "g":
             if etat["fusion"] is None:
                 etat["fusion"] = set()
-                etat["texte_fusion"].set_text("FUSION : cliquer les pistes  (g = fusionner · Échap = annuler)")
+                etat["texte_fusion"].set_text("FUSION : cliquer ou encadrer les pistes  (g = fusionner · Échap = annuler)")
                 fig.canvas.draw_idle()
             elif len(etat["fusion"]) >= 2:
                 etat["a_fusionner"] = sorted(etat["fusion"])
@@ -2347,7 +2419,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
     bouton_e.on_clicked(basculer_epure)
     etat["basculer_epure"] = basculer_epure
     etat["texte_vue"] = fig.text(0, 0, "Vue d'ensemble", va="center", fontsize=10, fontweight="bold")
-    etat["texte_fusion"] = fig.text(0, 0, "", va="center", fontsize=10, fontweight="bold", color="tab:red")
+    etat["texte_fusion"] = fig.text(0, 0, "", ha="center", va="bottom", fontsize=10, fontweight="bold", color="tab:red", bbox=dict(facecolor="white", edgecolor="tab:red", alpha=0.9, pad=3), zorder=20)
 
     def mise_en_page(_=None):
         """Positions calculées une fois, à la taille nominale de la figure : en plein écran, les proportions
@@ -2361,7 +2433,7 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
         ax_d.set_position([bb.x0 + 0.031, bb.y1 + 0.004, 0.028, hb])
         ax_e.set_position([bb.x1 - 0.085, bb.y1 + 0.004, 0.085, hb])
         etat["texte_vue"].set_position((bb.x0 + 0.066, bb.y1 + 0.02))
-        etat["texte_fusion"].set_position((bb.x0 + 0.30, bb.y1 + 0.02))
+        etat["texte_fusion"].set_position((bb.x0 + bb.width / 2, bb.y0 + 0.01))
         dessiner_panneaux()
 
     mise_en_page()
@@ -2370,6 +2442,10 @@ def animer_resultats(acq, resultats, detections, chemin, sigma_psf=None, exclues
     anim = FuncAnimation(fig, maj, frames=n, interval=1000 * dt, repeat=True)
     fig.canvas.mpl_connect("key_press_event", touche)
     fig.canvas.mpl_connect("button_press_event", clic)
+    fig.canvas.mpl_connect("motion_notify_event", glisser)
+    fig.canvas.mpl_connect("button_release_event", relacher)
+    etat["rect"] = ax_v.add_patch(plt.Rectangle((0, 0), 0, 0, fill=True, facecolor="yellow", alpha=0.15,
+                                                edgecolor="yellow", lw=1.2, ls="--", visible=False, zorder=10))
     fig.canvas.mpl_connect("scroll_event", molette)
     fig._anim = anim                # garde une référence, sinon l'animation s'arrête
     plt.show()
@@ -2401,18 +2477,33 @@ def lettre_option(p):
     return m.group(1) if m else "-"
 
 
+def _videos_du_dossier(d):
+    return sorted(p for p in d.iterdir() if p.is_file() and not p.stem.endswith(("_annote", "_conditions"))
+                  and p.suffix.lower() in EXTENSIONS_TIFF | EXTENSIONS_VIDEO)      # pas les vidéos exportées
+
+
+def _sous_dossier_de_videos(d):
+    """Sous-dossier qui contient des vidéos complètes avec leur .json (ex. _avant_premier_trou) : on liste ses
+    fichiers un par un. (Un dossier d'images TIFF séparées, sans .json, reste UNE acquisition.)"""
+    return d.is_dir() and any(q.suffix.lower() == ".json" for q in d.iterdir()) and bool(_videos_du_dossier(d))
+
+
 def choisir_fichier(dossier=DOSSIER_DONNEES):
-    candidats = sorted(p for p in dossier.iterdir()
-                       if not p.stem.endswith(("_annote", "_conditions"))                 # vidéos exportées par l'analyse 2
-                       and p.suffix.lower() in EXTENSIONS_TIFF | EXTENSIONS_VIDEO
-                       or (p.is_dir() and any(q.suffix.lower() in EXTENSIONS_TIFF | {".png"}
-                                              for q in p.iterdir())))
+    sous = [d for d in sorted(dossier.iterdir()) if _sous_dossier_de_videos(d)]
+    candidats = _videos_du_dossier(dossier) + sorted(
+        p for p in dossier.iterdir()
+        if p.is_dir() and p not in sous and any(q.suffix.lower() in EXTENSIONS_TIFF | {".png"} for q in p.iterdir()))
+    for d in sous:
+        candidats += _videos_du_dossier(d)
     if not candidats:
         raise FileNotFoundError(f"Aucune acquisition dans {dossier}")
     print(f"Acquisitions dans {dossier} :")
     for k, p in enumerate(candidats, 1):
         taille = (sum(q.stat().st_size for q in p.iterdir()) if p.is_dir() else p.stat().st_size) / 1e6
-        print(f"  {k}. [{lettre_option(p)}] {p.name}   ({taille:.0f} Mo)"
+        nom = p.relative_to(dossier).as_posix()
+        if p.parent != dossier and (k == 1 or candidats[k - 2].parent != p.parent):
+            print(f"  --- dans {p.parent.name}/ ---")
+        print(f"  {k}. [{lettre_option(p)}] {nom}   ({taille:.0f} Mo)"
               + ("" if chemin_json(p).exists() else "   (pas de .json)"))
     # .json d'acquisition dont les images n'ont pas été copiées : signalés, mais pas sélectionnables
     orphelins = []
@@ -2524,7 +2615,15 @@ if __name__ == "__main__":
 
     kw_det, dist_max_px, demi = parametres_pixels(pixel_eff)
 
-    sigma_psf, disp_psf, n_fit = estimer_sigma_psf(frames, demi=demi, **kw_det)
+    try:
+        sigma_psf, disp_psf, n_fit = estimer_sigma_psf(frames, demi=demi, **kw_det)
+        if n_fit < 5:
+            raise RuntimeError
+    except RuntimeError:
+        # Éclairage très non uniforme (taches faibles sur un fond en gradient) : le seuil global ne voit rien.
+        print("Peu ou pas de taches détectées : retrait du fond lisse (éclairage non uniforme), image par image...")
+        retirer_fond_lent(frames, 2 * demi + 1)
+        sigma_psf, disp_psf, n_fit = estimer_sigma_psf(frames, demi=demi, **kw_det)
     print(f"σ_PSF mesuré : {sigma_psf:.2f} ± {disp_psf:.2f} px ({sigma_psf*pixel_eff*1e6:.2f} µm), {n_fit} PSF")
     # Garde-fous tirés de la taille MESURÉE des taches (indépendants de l'échelle supposée) :
     # - deux maxima à moins de 2σ appartiennent à la même bille (évite les doubles détections);
