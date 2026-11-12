@@ -1,0 +1,5 @@
+# fichiers lourds : à ne pas pousser dans le dépôt
+*.tif
+*.mp4
+sim/
+res/*.pkl
