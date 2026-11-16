@@ -126,16 +126,22 @@ def demarrer_camera(fps, expo_ms):
     cam = Picamera2()
     taille = cam.sensor_resolution  # (4056, 3040) pour l'IMX477
     duree_us = int(1e6 / fps)
-    config = cam.create_still_configuration(
-        main={"size": taille, "format": "RGB888"},
-        buffer_count=4,
-        controls={
-            "FrameDurationLimits": (duree_us, duree_us),
+    controles = {"FrameDurationLimits": (duree_us, duree_us)}
+    if expo_ms > 0:  # exposition manuelle
+        controles.update({
             "ExposureTime": int(expo_ms * 1000),
             "AnalogueGain": GAIN_ANALOGIQUE,
             "AwbEnable": False,
             "ColourGains": (1.0, 1.0),
-        },
+        })
+    else:            # aperçu automatique (comme dans le mandat précédent)
+        controles.update({"AeEnable": True, "AwbEnable": True})
+    config = cam.create_still_configuration(
+        main={"size": taille, "format": "RGB888"},
+        lores={"size": (taille[0] // 4, taille[1] // 4)},  # flux léger pour l'aperçu
+        display="lores",  # sans ça, une config "still" n'affiche rien (fenêtre grise)
+        buffer_count=4,
+        controls=controles,
     )
     cam.configure(config)
     print(f"Résolution : {taille[0]} x {taille[1]}")
@@ -149,6 +155,27 @@ def demarrer_camera(fps, expo_ms):
             cam.start_preview(Preview.NULL)
     cam.start()
     return cam, taille
+
+
+def verrouiller(cam, expo_ms):
+    """
+    En mode automatique (expo_ms = 0), fige exposition, gain et balance des
+    blancs sur les valeurs de l'aperçu pour que toutes les images (et la
+    référence vs la mesure) soient acquises avec les mêmes réglages.
+    Retourne l'exposition utilisée (ms).
+    """
+    if expo_ms > 0:
+        return expo_ms
+    meta = cam.capture_metadata()
+    expo_us, gain = meta["ExposureTime"], meta["AnalogueGain"]
+    cam.set_controls({"AeEnable": False, "AwbEnable": False,
+                      "ExposureTime": expo_us, "AnalogueGain": gain,
+                      "ColourGains": meta["ColourGains"]})
+    for _ in range(4):  # laisser les nouveaux réglages s'appliquer
+        cam.capture_metadata()
+    print(f"Réglages verrouillés : exposition {expo_us / 1000:.1f} ms, "
+          f"gain {gain:.2f}")
+    return expo_us / 1000.0
 
 
 def acquerir(cam, n, dossier):
@@ -208,6 +235,7 @@ def ecrire_params(chemin, lignes):
 # ============================== Mode 1 : source ==============================
 def mode_source(cam, taille, n, fps, expo_ms, dossier):
     input("\nAperçu en cours. Ajustez le montage, puis Entrée pour acquérir...")
+    expo_ms = verrouiller(cam, expo_ms)
     images, fps_reel = acquerir(cam, n, os.path.join(dossier, "images"))
     cam.stop()
     cam.close()
@@ -286,12 +314,18 @@ def mode_filtre(cam, taille, n, fps, expo_ms, dossier):
     else:
         input("\nRetirez le filtre, ajustez l'aperçu, puis Entrée pour acquérir "
               "la RÉFÉRENCE...")
+        expo_ms = verrouiller(cam, expo_ms)
         imgs, fps_ref = acquerir(cam, n, os.path.join(dossier, "reference"))
         profils_ref, bande = traiter(imgs)
         del imgs
         i_ref = profils_ref.mean(axis=0)
 
     input("\nInsérez le filtre à caractériser, puis Entrée pour acquérir la MESURE...")
+    if choix == "2":  # référence chargée : fixer l'exposition ici
+        if expo_ms == 0:
+            print("ATTENTION : exposition auto avec référence chargée -> utilisez "
+                  "plutôt la même exposition manuelle que pour la référence.")
+        expo_ms = verrouiller(cam, expo_ms)
     imgs, fps_mes = acquerir(cam, n, os.path.join(dossier, "mesure"))
     cam.stop()
     cam.close()
@@ -398,7 +432,7 @@ def main():
     if fps > 10:
         print("fps > 10 impossible à pleine résolution -> fps = 10")
         fps = 10.0
-    expo_ms = demander("Temps d'exposition (ms)", EXPOSITION_MS_DEFAUT, float)
+    expo_ms = demander("Temps d'exposition en ms (0 = automatique)", 0.0, float)
     if expo_ms > 1000.0 / fps:
         expo_ms = 1000.0 / fps * 0.95
         print(f"Exposition limitée à {expo_ms:.1f} ms (période d'image).")
