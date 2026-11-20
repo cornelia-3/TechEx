@@ -4,15 +4,22 @@
 PHS3910 - Mandat 4 : Spectromètre
 Acquisition avec Raspberry Pi 4 + caméra HQ (SC1220, Sony IMX477R)
 
-Deux modes :
+Trois modes :
   1) Source / laser : spectre d'intensité (position et largeur du pic)
   2) Filtre en transmission : acquisition d'une référence (sans filtre) puis
      d'une mesure (avec filtre) -> spectre de transmission T = I_mes / I_réf
      + longueurs d'onde de coupure (T = 50 % du max) avec incertitudes
+  3) Réglage de l'exposition (sur la saturation RAW) + image avec filtre
+     optionnelle + image dark
 
-Dans les deux modes : aperçu en direct, résolution maximale (4056 x 3040),
-nombre d'images (défaut 10) et cadence (défaut 10 fps) au choix, images
-enregistrées en PNG.
+Pour chaque image acquise, trois fichiers sont enregistrés :
+  - raw_XXX.npy   : RAW 12 bits non traité (tableau uint16, valeurs 0..4095)
+  - image_XXX.dng : RAW au format DNG (s'ouvre dans RawTherapee, darktable...)
+  - image_XXX.png : image traitée 8 bits, PNG NON compressé
+
+La saturation est calculée sur le RAW (par canal R, V, B du motif de Bayer).
+Les spectres affichés par ce script viennent encore des PNG 8 bits (aperçu
+rapide) ; pour des intensités quantitatives, analyser les .npy dans le notebook.
 
 Dépendances : sudo apt install python3-picamera2 python3-opencv python3-matplotlib
 """
@@ -40,6 +47,14 @@ LISSAGE_PX = 5               # lissage du spectre (fenêtre en pixels)
 SEUIL_REF = 0.10             # T ignorée où I_réf < 10 % du max de I_réf
 FRACTION_COUPURE = 0.50      # coupure définie à 50 % de la transmission max
 
+# Saturation RAW : un pixel est saturé s'il est à moins de MARGE_SAT du blanc
+MARGE_SAT = 5                # (4095 - 5 = 4090 en 12 bits)
+SEUIL_SAT_PCT = 0.1          # avertissement si > 0,1 % de pixels saturés dans la bande
+
+# Focales (mm), optionnel : permet d'estimer l'image de la fente sur le capteur
+F1_MM, F2_MM = None, None
+LARGEUR_FENTE_UM = 0.0       # rempli par main()
+
 # Calibration pixel -> longueur d'onde : liste de (position_pixel, lambda_nm)
 # mesurées avec des lasers connus (ex. [(1200, 532.0), (2900, 650.0)]).
 # Avec >= 2 points : ajustement linéaire. Sinon : axe en pixels.
@@ -47,6 +62,10 @@ CALIBRATION = []
 
 # Incertitude de calibration (nm) ajoutée en quadrature aux coupures
 U_CALIBRATION_NM = 0.0
+
+# Infos RAW remplies par demarrer_camera()
+RAW = {"bits": 12, "blanc": 4095, "motif": "RGGB", "w": 4056, "h": 3040}
+_dng_erreur = [False]
 # ----------------------------------------------------------------------------
 
 
@@ -124,7 +143,17 @@ def coupures(x, T):
 # ============================== Caméra =======================================
 def demarrer_camera(fps, expo_ms):
     cam = Picamera2()
-    taille = cam.sensor_resolution  # (4056, 3040) pour l'IMX477
+    taille = tuple(cam.sensor_resolution)  # (4056, 3040) pour l'IMX477
+
+    # Mode capteur pleine résolution, avec la plus grande profondeur de bits (12)
+    modes = [m for m in cam.sensor_modes if tuple(m["size"]) == taille]
+    if not modes:
+        modes = list(cam.sensor_modes)
+    mode = max(modes, key=lambda m: m["bit_depth"])
+    fmt = mode.get("unpacked") or mode["format"].replace("_CSI2P", "")  # ex. SRGGB12
+    RAW.update({"bits": mode["bit_depth"], "blanc": (1 << mode["bit_depth"]) - 1,
+                "motif": fmt[1:5], "w": taille[0], "h": taille[1]})
+
     duree_us = int(1e6 / fps)
     controles = {"FrameDurationLimits": (duree_us, duree_us)}
     if expo_ms > 0:  # exposition manuelle
@@ -139,12 +168,15 @@ def demarrer_camera(fps, expo_ms):
     config = cam.create_still_configuration(
         main={"size": taille, "format": "RGB888"},
         lores={"size": (taille[0] // 4, taille[1] // 4)},  # flux léger pour l'aperçu
+        raw={"size": tuple(mode["size"]), "format": fmt},   # RAW non compacté (16 bits)
+        sensor={"output_size": tuple(mode["size"]), "bit_depth": mode["bit_depth"]},
         display="lores",  # sans ça, une config "still" n'affiche rien (fenêtre grise)
-        buffer_count=4,
+        buffer_count=3,   # si erreur d'allocation mémoire (CMA) : mettre 2
         controls=controles,
     )
     cam.configure(config)
-    print(f"Résolution : {taille[0]} x {taille[1]}")
+    print(f"Résolution : {taille[0]} x {taille[1]} | RAW {fmt}, "
+          f"{RAW['bits']} bits (blanc = {RAW['blanc']})")
     try:
         cam.start_preview(Preview.QTGL)
     except Exception:
@@ -178,27 +210,107 @@ def verrouiller(cam, expo_ms):
     return expo_us / 1000.0
 
 
-def acquerir(cam, n, dossier):
-    """Capte n images, les enregistre en PNG. Retourne (images, fps_reel)."""
+# ------------------------------- RAW / saturation ----------------------------
+def capturer(cam):
+    """Une capture : (image main BGR, buffer RAW, métadonnées)."""
+    req = cam.capture_request()
+    try:
+        img = req.make_array("main")     # tableau BGR (convention OpenCV)
+        buf = req.make_buffer("raw")     # copie du RAW brut
+        meta = req.get_metadata()
+    finally:
+        req.release()
+    return img, buf, meta
+
+
+def buffer_vers_raw(cam, buf):
+    """Buffer RAW -> tableau uint16 (h, w), valeurs 0..blanc."""
+    cfg = cam.camera_config["raw"]
+    w, h = cfg["size"]
+    a = np.ascontiguousarray(cam.helpers.make_array(buf, cfg))
+    if a.dtype == np.uint8:
+        a = a.view(np.uint16)
+    return a[:h, :w].copy()
+
+
+def sauver_image(cam, dossier, i, img, raw, buf, meta, prefixe="image"):
+    """Enregistre .png (non compressé), .npy (RAW) et .dng pour une image."""
     os.makedirs(dossier, exist_ok=True)
-    images, instants = [], []
+    cv2.imwrite(os.path.join(dossier, f"{prefixe}_{i:03d}.png"), img,
+                [cv2.IMWRITE_PNG_COMPRESSION, 0])           # 0 = non compressé
+    np.save(os.path.join(dossier, f"raw_{i:03d}.npy"), raw)
+    try:
+        cam.helpers.save_dng(buf, meta, cam.camera_config,
+                             os.path.join(dossier, f"{prefixe}_{i:03d}.dng"))
+    except Exception as e:
+        if not _dng_erreur[0]:
+            print(f"  ATTENTION : DNG non enregistré ({e}). .npy et .png sont enregistrés.")
+            _dng_erreur[0] = True
+
+
+def compte_sat_lignes(raw):
+    """Nombre de pixels saturés par ligne, par canal (R, V, B) -> (3, h)."""
+    seuil = RAW["blanc"] - MARGE_SAT
+    out = np.zeros((3, raw.shape[0]), dtype=np.int32)
+    for k, lettre in enumerate(RAW["motif"]):
+        i, j = divmod(k, 2)
+        out["RGB".index(lettre), i::2] += (raw[i::2, j::2] >= seuil).sum(axis=1)
+    return out
+
+
+def pct_saturation(sat_lignes, y1, y2):
+    """% de pixels saturés dans la bande [y1, y2), par canal -> [R, V, B]."""
+    frac = {"R": 0.25, "G": 0.5, "B": 0.25}   # part de chaque canal dans le motif de Bayer
+    n = sat_lignes.shape[0]
+    pct = []
+    for k, c in enumerate("RGB"):
+        tot = n * (y2 - y1) * RAW["w"] * frac[c]
+        pct.append(100.0 * sat_lignes[:, k, y1:y2].sum() / max(tot, 1))
+    return np.array(pct)
+
+
+def rapport_saturation(sat, bande, etiquette=""):
+    """Affiche la saturation RAW dans la bande et avertit si nécessaire."""
+    sat_l, raw_max = sat
+    _, y1, y2 = bande
+    p = pct_saturation(sat_l, y1, y2)
+    print(f"Saturation RAW {etiquette}(bande {y1}-{y2}) : R/V/B = "
+          f"{p[0]:.3f}/{p[1]:.3f}/{p[2]:.3f} % | max RAW = {max(raw_max)}/{RAW['blanc']}")
+    if p.max() > SEUIL_SAT_PCT:
+        print("ATTENTION : saturation RAW -> réduire l'exposition ou l'intensité "
+              "de la source (mode 3 pour ajuster).")
+    return p
+
+
+def acquerir(cam, n, dossier):
+    """
+    Capte n images ; enregistre pour chacune .png, .npy et .dng.
+    Retourne (images PNG, fps_reel, (saturation par ligne, max RAW)).
+    """
+    os.makedirs(dossier, exist_ok=True)
+    images, bufs, metas, instants = [], [], [], []
     t0 = time.time()
     for i in range(n):
-        images.append(cam.capture_array("main"))  # tableau BGR (convention OpenCV)
+        img, buf, meta = capturer(cam)
+        images.append(img)
+        bufs.append(buf)
+        metas.append(meta)
         instants.append(time.time() - t0)
         print(f"  image {i + 1}/{n}", end="\r")
     print()
     fps_reel = (n - 1) / (instants[-1] - instants[0]) if n > 1 else float("nan")
     print(f"Cadence réelle : {fps_reel:.2f} fps")
-    for i, img in enumerate(images):
-        cv2.imwrite(os.path.join(dossier, f"image_{i:03d}.png"), img,
-                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
-    maxi = max(int(im.max()) for im in images)
-    if maxi >= 250:
-        print(f"ATTENTION : saturation détectée (max = {maxi}/255). "
-              "Réduire l'exposition ou l'intensité de la source.")
+
+    print("Enregistrement (.png, .npy, .dng)...")
+    sat_lignes, raw_max = [], []
+    for i in range(n):
+        raw = buffer_vers_raw(cam, bufs[i])
+        sauver_image(cam, dossier, i, images[i], raw, bufs[i], metas[i])
+        sat_lignes.append(compte_sat_lignes(raw))
+        raw_max.append(int(raw.max()))
+        bufs[i] = None   # libère la mémoire au fur et à mesure
     print(f"Images enregistrées dans {dossier}/")
-    return images, fps_reel
+    return images, fps_reel, (np.array(sat_lignes), raw_max)
 
 
 def image_somme(img):
@@ -229,18 +341,22 @@ def traiter(images, bande=None):
 
 def ecrire_params(chemin, lignes):
     with open(chemin, "w", encoding="utf-8") as f:
-        f.write("\n".join(lignes) + "\n")
+        f.write("\n".join(lignes + [
+            f"Largeur de la fente (um) : {LARGEUR_FENTE_UM}",
+            f"RAW : {RAW['bits']} bits, blanc {RAW['blanc']}, motif {RAW['motif']}",
+        ]) + "\n")
 
 
 # ============================== Mode 1 : source ==============================
 def mode_source(cam, taille, n, fps, expo_ms, dossier):
     input("\nAperçu en cours. Ajustez le montage, puis Entrée pour acquérir...")
     expo_ms = verrouiller(cam, expo_ms)
-    images, fps_reel = acquerir(cam, n, os.path.join(dossier, "images"))
+    images, fps_reel, sat = acquerir(cam, n, os.path.join(dossier, "images"))
     cam.stop()
     cam.close()
 
     profils, (y0, y1, y2) = traiter(images)
+    rapport_saturation(sat, (y0, y1, y2))
     derniere = cv2.cvtColor(images[-1], cv2.COLOR_BGR2RGB)[::8, ::8]
     del images
 
@@ -315,8 +431,9 @@ def mode_filtre(cam, taille, n, fps, expo_ms, dossier):
         input("\nRetirez le filtre, ajustez l'aperçu, puis Entrée pour acquérir "
               "la RÉFÉRENCE...")
         expo_ms = verrouiller(cam, expo_ms)
-        imgs, fps_ref = acquerir(cam, n, os.path.join(dossier, "reference"))
+        imgs, fps_ref, sat_ref = acquerir(cam, n, os.path.join(dossier, "reference"))
         profils_ref, bande = traiter(imgs)
+        rapport_saturation(sat_ref, bande, "référence ")
         del imgs
         i_ref = profils_ref.mean(axis=0)
 
@@ -326,10 +443,11 @@ def mode_filtre(cam, taille, n, fps, expo_ms, dossier):
             print("ATTENTION : exposition auto avec référence chargée -> utilisez "
                   "plutôt la même exposition manuelle que pour la référence.")
         expo_ms = verrouiller(cam, expo_ms)
-    imgs, fps_mes = acquerir(cam, n, os.path.join(dossier, "mesure"))
+    imgs, fps_mes, sat_mes = acquerir(cam, n, os.path.join(dossier, "mesure"))
     cam.stop()
     cam.close()
     profils_mes, bande = traiter(imgs, bande)
+    rapport_saturation(sat_mes, bande, "mesure ")
     derniere = cv2.cvtColor(imgs[-1], cv2.COLOR_BGR2RGB)[::8, ::8]
     del imgs
     y0, y1, y2 = bande
@@ -422,10 +540,108 @@ def mode_filtre(cam, taille, n, fps, expo_ms, dossier):
     plt.show()
 
 
+# ============================== Mode 3 : réglage exposition + dark ===========
+def bande_lumineuse(img):
+    lignes = lisser(image_somme(img).sum(axis=1), 15)
+    y0 = int(np.argmax(lignes))
+    return y0, max(0, y0 - DEMI_HAUTEUR_BANDE), min(img.shape[0], y0 + DEMI_HAUTEUR_BANDE)
+
+
+def appliquer_exposition(cam, expo_ms):
+    cam.set_controls({"ExposureTime": int(expo_ms * 1000)})
+    for _ in range(4):  # laisser le réglage s'appliquer
+        cam.capture_metadata()
+
+
+def stats_bande_raw(raw, y1, y2):
+    """(% saturés [R, V, B], max RAW, percentile 99,9) dans la bande."""
+    pct = pct_saturation(compte_sat_lignes(raw)[None], y1, y2)
+    sub = raw[y1:y2]
+    return pct, int(sub.max()), float(np.percentile(sub, 99.9))
+
+
+def mode_reglage(cam, taille, fps, expo_ms, dossier):
+    input("\nAperçu en cours. Placez la source, puis Entrée...")
+    expo_ms = verrouiller(cam, expo_ms)   # fige l'exposition si elle était auto
+    expo_max = 1000.0 / fps * 0.95
+    blanc = RAW["blanc"]
+
+    for essai in range(10):
+        img, buf, _ = capturer(cam)
+        raw = buffer_vers_raw(cam, buf)
+        _, y1, y2 = bande_lumineuse(img)
+        pct, mx, p = stats_bande_raw(raw, y1, y2)
+        print(f"Essai {essai + 1} : {expo_ms:.2f} ms | saturés R/V/B = "
+              f"{pct[0]:.3f}/{pct[1]:.3f}/{pct[2]:.3f} % | max RAW = {mx}/{blanc} "
+              f"| p99.9 = {p:.0f}")
+        if pct.max() > SEUIL_SAT_PCT:        # saturé -> on réduit
+            nouv = expo_ms * 0.7
+        elif p < 0.5 * blanc:                # trop sombre -> on augmente
+            nouv = min(expo_ms * 0.75 * blanc / max(p, 1), expo_ms * 2, expo_max)
+        else:
+            break                            # bien exposé
+        if abs(nouv - expo_ms) < 0.01 or nouv < 0.1:
+            break
+        expo_ms = nouv
+        appliquer_exposition(cam, expo_ms)
+
+    # Image retenue (une seule), enregistrée dans images/ pour le notebook
+    img, buf, meta = capturer(cam)
+    raw = buffer_vers_raw(cam, buf)
+    _, y1, y2 = bande_lumineuse(img)
+    sauver_image(cam, os.path.join(dossier, "images"), 0, img, raw, buf, meta)
+    pct, mx, _ = stats_bande_raw(raw, y1, y2)
+    print(f"\nImage enregistrée (.png, .npy, .dng). Saturation RAW R/V/B = "
+          f"{pct[0]:.3f}/{pct[1]:.3f}/{pct[2]:.3f} % | max RAW = {mx}/{blanc}")
+    if pct.max() > SEUIL_SAT_PCT:
+        print("ATTENTION : encore saturé -> relancer le mode 3 avec une exposition plus courte.")
+    print(f"=> Exposition retenue : {expo_ms:.2f} ms")
+
+    # Optionnel : une image AVEC le filtre (même exposition, même gain)
+    rep = input("\nAjouter le filtre et prendre une image avec filtre ? [o/N] : ")
+    avec_filtre = rep.strip().lower() in ("o", "oui", "y")
+    if avec_filtre:
+        input("Insérez le filtre, puis Entrée...")
+        img_f, buf_f, meta_f = capturer(cam)
+        raw_f = buffer_vers_raw(cam, buf_f)
+        sauver_image(cam, os.path.join(dossier, "mesure"), 0, img_f, raw_f, buf_f, meta_f)
+        pct_f, mx_f, _ = stats_bande_raw(raw_f, y1, y2)
+        print(f"Image avec filtre enregistrée. Saturation RAW R/V/B = "
+              f"{pct_f[0]:.3f}/{pct_f[1]:.3f}/{pct_f[2]:.3f} % | max RAW = {mx_f}/{blanc}")
+
+    # Image dark : MÊME exposition et MÊME gain, sans lumière
+    input("\nBloquez la lumière (lampe éteinte ou entrée du spectromètre couverte), "
+          "puis Entrée pour l'image DARK...")
+    img_d, buf_d, meta_d = capturer(cam)
+    raw_d = buffer_vers_raw(cam, buf_d)
+    sauver_image(cam, os.path.join(dossier, "dark"), 0, img_d, raw_d, buf_d, meta_d,
+                 prefixe="dark")
+    noir = meta_d.get("SensorBlackLevels")
+    print(f"Dark enregistré. RAW : moyenne {raw_d.mean():.1f}, max {int(raw_d.max())} "
+          f"| niveaux de noir capteur : {noir}")
+
+    ecrire_params(os.path.join(dossier, "parametres.txt"), [
+        "Mode : reglage exposition + dark",
+        f"Exposition retenue (ms) : {expo_ms:.3f} | Gain : {GAIN_ANALOGIQUE}",
+        f"Bande lignes : {y1}-{y2}",
+        f"Image avec filtre : {'oui' if avec_filtre else 'non'}",
+        f"Niveaux de noir capteur : {noir}",
+    ])
+    cam.stop()
+    cam.close()
+
+
 # ============================== Programme ====================================
 def main():
-    mode = input("Mode : [1] source / laser   [2] filtre en transmission  [1] : ").strip()
-    mode = 2 if mode == "2" else 1
+    global LARGEUR_FENTE_UM
+    LARGEUR_FENTE_UM = demander("Largeur de la fente (µm, 0 = inconnue)", 50.0, float)
+    if LARGEUR_FENTE_UM > 0 and F1_MM and F2_MM:
+        l_px = LARGEUR_FENTE_UM * (F2_MM / F1_MM) / 1.55
+        print(f"Image attendue de la fente : ~{l_px:.0f} px (largeur d'une raie)")
+
+    mode = input("Mode : [1] source/laser  [2] filtre en transmission  "
+                 "[3] réglage exposition + dark  [1] : ").strip()
+    mode = int(mode) if mode in ("2", "3") else 1
 
     n = demander("Nombre d'images à capter (par acquisition)", N_IMAGES_DEFAUT, int)
     fps = demander("Images par seconde (max 10 en pleine résolution)", FPS_DEFAUT, float)
@@ -436,9 +652,10 @@ def main():
     if expo_ms > 1000.0 / fps:
         expo_ms = 1000.0 / fps * 0.95
         print(f"Exposition limitée à {expo_ms:.1f} ms (période d'image).")
-    if n > 40:
+    if n > 30:
         print("Note : les images d'une acquisition sont gardées en RAM "
-              "(~37 Mo/image) ; au-delà de ~40, risque de manquer de mémoire.")
+              "(~60 Mo/image) ; au-delà de ~30, risque de manquer de mémoire. "
+              "Espace disque : ~90 Mo/image (.png + .npy + .dng).")
 
     dossier = os.path.join(DOSSIER_SORTIE, datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(dossier, exist_ok=True)
@@ -446,8 +663,10 @@ def main():
     cam, taille = demarrer_camera(fps, expo_ms)
     if mode == 1:
         mode_source(cam, taille, n, fps, expo_ms, dossier)
-    else:
+    elif mode == 2:
         mode_filtre(cam, taille, n, fps, expo_ms, dossier)
+    else:
+        mode_reglage(cam, taille, fps, expo_ms, dossier)
 
 
 if __name__ == "__main__":
