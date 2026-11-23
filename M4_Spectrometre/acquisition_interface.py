@@ -553,7 +553,8 @@ class App:
         if not self.occupe:
             try:
                 rgb = cv2.cvtColor(
-                    self.cam.capture_array("lores"), cv2.COLOR_YUV420p2RGB
+                    self.cam.capture_array("lores"),
+                    cv2.COLOR_YUV2RGB_I420,
                 )[:, :1024]
                 self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.resize(rgb, (640, 480))))
                 self.lbl.config(image=self.photo)
@@ -763,15 +764,7 @@ class App:
                 ax.axvspan(debut_theo, fin_theo, color="0.2", alpha=0.13, zorder=0)
             ax.axvline(nm, color="0.2", ls=":", lw=1.5, label=label)
 
-        xv = x[i_ref > SEUIL_REF * i_ref.max()]
-        if xv.size:
-            gauche, droite = max(400, xv.min()), min(700, xv.max())
-            if gauche < droite:
-                if theorie is not None:
-                    marge = 0.02 * (droite - gauche)
-                    gauche = min(gauche, debut_theo - marge)
-                    droite = max(droite, fin_theo + marge)
-                ax.set_xlim(gauche, droite)
+        ax.set_xlim(400, 700)
         ax.set_xlabel("Longueur d’onde (nm)" + ("" if calibre else " — NON CALIBRÉ"))
         ax.set_ylabel("Transmission (u.a.)")
         ax.grid(alpha=0.3)
