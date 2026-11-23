@@ -20,7 +20,19 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from picamera2 import Picamera2
 
 
-DOSSIER_SORTIE = "acquisitions"
+DOSSIER_SORTIE = Path(__file__).resolve().parent / "acquisitions"
+DOSSIER_LASERS_PROFS = DOSSIER_SORTIE / "calibration" / "lasers"
+DOSSIER_TXT_PROFS = DOSSIER_SORTIE.parent / "references_profs"
+
+ASSOCIATIONS_LASERS = {
+    "532": ("532nm Laser (battery powered).txt", False),
+    "555": ("555nm Laser (battery powered).txt", False),
+    "571": ("571nm Laser (battery powered).txt", False),
+    "593": ("593nm Laser (battery powered).txt", False),
+    "650": ("635nm_laser_pointer_cat.txt", False),
+    # Ajoute les quatre autres lasers sur le même modèle.
+    # "nom_du_dossier": ("nom_exact_du_fichier.txt", False),
+}
 FPS, EXPO_MS, GAIN = 10.0, 20.0, 1.0
 
 # Réseau en réflexion, focale de sortie et pixels après binning 2 × 2.
@@ -153,6 +165,35 @@ def verifier_lasers(lasers):
     if ecarts.size and not (np.all(ecarts > 0) or np.all(ecarts < 0)):
         raise ValueError("Les raies d’ajustement doivent être ordonnées le long du capteur.")
 
+def charger_lasers_profs():
+    if not ASSOCIATIONS_LASERS:
+        raise ValueError("Renseignez ASSOCIATIONS_LASERS dans le script.")
+
+    lasers, dernier = [], None
+    for nom, (nom_txt, verification) in ASSOCIATIONS_LASERS.items():
+        dossier = DOSSIER_LASERS_PROFS / nom
+        txt = DOSSIER_TXT_PROFS / nom_txt
+
+        fichiers = sorted(dossier.glob("raw_*.npy"))
+        if not fichiers and (dossier / "raw.npy").is_file():
+            fichiers = [dossier / "raw.npy"]
+        if not fichiers:
+            raise ValueError(f"{dossier} : aucun raw.npy ou raw_*.npy.")
+
+        try:
+            nm = longueur_txt(txt)
+            px, intensite = profil_laser(np.load(f) for f in fichiers)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Laser {nom} · {txt.name} : {exc}") from exc
+
+        point = Laser(px, nm, intensite.size, verification, f"{nom} / {txt.name}")
+        lasers.append(point)
+        dernier = (point, intensite)
+
+    verifier_lasers(lasers)
+    if all(point.verification for point in lasers):
+        raise ValueError("Affectez au moins un laser à l’ajustement avec False.")
+    return lasers, dernier
 
 def calibrer(n, lasers):
     pts = [(p.px, p.nm) for p in lasers if not p.verification]
@@ -251,6 +292,13 @@ class App:
         root.title("Spectromètre — acquisition")
         self.construire()
         self.demarrer_camera()
+        dossier_lasers = (
+            DOSSIER_LASERS_PROFS
+            if DOSSIER_LASERS_PROFS.is_dir()
+            else DOSSIER_SORTIE / "calibration_lasers"
+        )
+        if dossier_lasers.is_dir():
+            root.after_idle(lambda: self.choisir_calib(dossier_lasers))
         self.apercu()
         root.protocol("WM_DELETE_WINDOW", self.fermer)
 
@@ -428,6 +476,13 @@ class App:
         self.occupation(True)
         try:
             dossier = Path(chemin)
+            if dossier.resolve() == DOSSIER_LASERS_PROFS.resolve():
+                self.lasers, dernier = charger_lasers_profs()
+                self.afficher_calib(dernier)
+                if manuel:
+                    self.nb.select(2)
+                self.log(f"{len(self.lasers)} lasers chargés depuis {dossier}.")
+                return
             nouveaux, dernier = [], None
             for d in [dossier] + sorted(p for p in dossier.iterdir() if p.is_dir()):
                 meta = d / "laser.json"
