@@ -169,16 +169,38 @@ def charger_lasers_profs():
     if not ASSOCIATIONS_LASERS:
         raise ValueError("Renseignez ASSOCIATIONS_LASERS dans le script.")
 
+    def contenu(d, motif="*"):
+        noms = sorted(f.name for f in d.glob(motif))
+        return ", ".join(noms) if noms else "(vide)"
+
+    for d, quoi in ((DOSSIER_LASERS_PROFS, "des RAW lasers"), (DOSSIER_TXT_PROFS, "des TXT lasers")):
+        if not d.is_dir():
+            raise FileNotFoundError(f"Dossier {quoi} introuvable :\n{d}")
+
     lasers, dernier = [], None
     for nom, (nom_txt, verification) in ASSOCIATIONS_LASERS.items():
         dossier = DOSSIER_LASERS_PROFS / nom
         txt = DOSSIER_TXT_PROFS / nom_txt
 
+        if not dossier.is_dir():
+            raise FileNotFoundError(
+                f"Laser {nom} : dossier absent\n{dossier}\n"
+                f"Sous-dossiers présents : {contenu(DOSSIER_LASERS_PROFS)}"
+            )
+        if not txt.is_file():
+            raise FileNotFoundError(
+                f"Laser {nom} : fichier TXT absent\n{txt}\n"
+                f"TXT présents : {contenu(DOSSIER_TXT_PROFS, '*.txt')}"
+            )
+
         fichiers = sorted(dossier.glob("raw_*.npy"))
         if not fichiers and (dossier / "raw.npy").is_file():
             fichiers = [dossier / "raw.npy"]
         if not fichiers:
-            raise ValueError(f"{dossier} : aucun raw.npy ou raw_*.npy.")
+            raise FileNotFoundError(
+                f"Laser {nom} : aucun raw.npy ou raw_*.npy dans\n{dossier}\n"
+                f"Fichiers présents : {contenu(dossier)}"
+            )
 
         try:
             nm = longueur_txt(txt)
@@ -278,6 +300,10 @@ def bootstrap(x, ordre, ref, mes):
 class App:
     def __init__(self, root):
         self.root, self.lasers, self.occupe = root, [], False
+        # Vrai seulement pendant la prise d'images : l'aperçu se fige alors.
+        # Le reste du temps (y compris pendant les boîtes de dialogue entre
+        # obscurité, lumière blanche sans filtre et avec filtre), il reste en direct.
+        self.en_capture = False
         self.expo = tk.DoubleVar(value=EXPO_MS)
         self.n_img = tk.IntVar(value=5)
         self.n_ang = tk.IntVar(value=3)
@@ -292,13 +318,7 @@ class App:
         root.title("Spectromètre — acquisition")
         self.construire()
         self.demarrer_camera()
-        dossier_lasers = (
-            DOSSIER_LASERS_PROFS
-            if DOSSIER_LASERS_PROFS.is_dir()
-            else DOSSIER_SORTIE / "calibration_lasers"
-        )
-        if dossier_lasers.is_dir():
-            root.after_idle(lambda: self.choisir_calib(dossier_lasers))
+        root.after_idle(self.calibration_demarrage)
         self.apercu()
         root.protocol("WM_DELETE_WINDOW", self.fermer)
 
@@ -435,6 +455,7 @@ class App:
             return
 
         self.occupation(True)
+        self.nb.select(0)
         try:
             if not messagebox.askokcancel(
                 "Capture laser",
@@ -479,8 +500,7 @@ class App:
             if dossier.resolve() == DOSSIER_LASERS_PROFS.resolve():
                 self.lasers, dernier = charger_lasers_profs()
                 self.afficher_calib(dernier)
-                if manuel:
-                    self.nb.select(2)
+                self.nb.select(2)
                 self.log(f"{len(self.lasers)} lasers chargés depuis {dossier}.")
                 return
             nouveaux, dernier = [], None
@@ -513,6 +533,59 @@ class App:
             messagebox.showerror("Dossier de calibration", str(exc), parent=self.root)
         finally:
             self.occupation(False)
+
+    def charger_calibration(self):
+        """Recharge la calibration des lasers (RAW + TXT).
+
+        Renvoie ((lasers, dernier), None) si tout va bien,
+        sinon (None, description de l'erreur).
+        """
+        try:
+            return charger_lasers_profs(), None
+        except Exception as exc:  # on veut voir toute erreur, pas la masquer
+            return None, f"{type(exc).__name__} : {exc}"
+
+    def calibration_demarrage(self):
+        resultat, erreur = self.charger_calibration()
+        if erreur is not None:
+            self.log("ERREUR : calibration non chargée au démarrage.")
+            messagebox.showerror(
+                "Calibration introuvable",
+                "Impossible de charger la calibration des lasers au démarrage.\n\n"
+                f"{erreur}\n\n"
+                "Elle sera retentée au début de chaque mesure en lumière blanche.",
+                parent=self.root,
+            )
+            return
+        self.lasers, dernier = resultat
+        self.afficher_calib(dernier)
+        self.log(f"Calibration chargée : {len(self.lasers)} lasers.")
+
+    def calibration_pour_mesure(self):
+        """Recharge la calibration avant une mesure en lumière blanche.
+
+        Renvoie la liste des lasers à utiliser ([] = sans calibration),
+        ou None si l'utilisateur annule la mesure.
+        """
+        resultat, erreur = self.charger_calibration()
+        if erreur is None:
+            self.lasers, dernier = resultat
+            self.afficher_calib(dernier)
+            self.log(f"Calibration rechargée : {len(self.lasers)} lasers.")
+            return list(self.lasers)
+
+        self.log("ERREUR : calibration non chargée.")
+        if not messagebox.askyesno(
+            "Calibration introuvable",
+            "Impossible de charger la calibration des lasers.\n\n"
+            f"{erreur}\n\n"
+            "Continuer SANS calibration (axe nominal, 550 nm au centre)?",
+            icon="error",
+            parent=self.root,
+        ):
+            return None
+        self.log("ATTENTION : mesure lancée sans calibration.")
+        return []
 
     def sans_calib(self):
         self.lasers = []
@@ -605,7 +678,7 @@ class App:
         return True
 
     def apercu(self):
-        if not self.occupe:
+        if not self.en_capture:
             try:
                 rgb = cv2.cvtColor(
                     self.cam.capture_array("lores"),
@@ -634,16 +707,20 @@ class App:
 
     def images(self, sous, n):
         os.makedirs(sous, exist_ok=True)
-        for i in range(n):
-            img, buf = self.capturer()
-            raw = self.buffer_vers_raw(buf)
-            cv2.imwrite(
-                os.path.join(sous, f"image_{i:03d}.png"),
-                img, [cv2.IMWRITE_PNG_COMPRESSION, 0],
-            )
-            np.save(os.path.join(sous, f"raw_{i:03d}.npy"), raw)
-            self.log(f"  {os.path.basename(sous)} : image {i + 1}/{n}")
-            yield raw
+        self.en_capture = True
+        try:
+            for i in range(n):
+                img, buf = self.capturer()
+                raw = self.buffer_vers_raw(buf)
+                cv2.imwrite(
+                    os.path.join(sous, f"image_{i:03d}.png"),
+                    img, [cv2.IMWRITE_PNG_COMPRESSION, 0],
+                )
+                np.save(os.path.join(sous, f"raw_{i:03d}.npy"), raw)
+                self.log(f"  {os.path.basename(sous)} : image {i + 1}/{n}")
+                yield raw
+        finally:
+            self.en_capture = False
 
     def mesurer(self, sous, n, noir, bande=None):
         profs, sat = [], 0.0
@@ -691,7 +768,13 @@ class App:
             DOSSIER_SORTIE, datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         self.occupation(True)
+        self.nb.select(0)  # onglet Aperçu visible pendant toute la séquence
         try:
+            lasers = self.calibration_pour_mesure()
+            if lasers is None:
+                return
+            self.nb.select(0)
+
             if not self.appliquer_expo():
                 return
 
@@ -714,8 +797,25 @@ class App:
 
             ref, bande = self.mesurer(os.path.join(dossier, "reference"), n, noir)
 
+            if lasers and lasers[0].largeur != ref.shape[1]:
+                self.log("ERREUR : largeur des RAW lasers ≠ largeur de la mesure.")
+                if not messagebox.askyesno(
+                    "Calibration incompatible",
+                    f"Les RAW lasers font {lasers[0].largeur} pixels binnés de large, "
+                    f"la mesure en fait {ref.shape[1]}.\n"
+                    "Les lasers ont sans doute été pris avec une autre résolution "
+                    "ou un autre mode du capteur.\n\n"
+                    "Continuer SANS calibration (axe nominal, 550 nm au centre)?",
+                    icon="error",
+                    parent=self.root,
+                ):
+                    return
+                lasers = []
+                self.log("ATTENTION : mesure poursuivie sans calibration.")
+
             mesures = []
             for k in range(na):
+                self.nb.select(0)
                 angle = simpledialog.askfloat(
                     "Angle",
                     f"Mesure {k + 1}/{na}\n"
@@ -733,15 +833,15 @@ class App:
                 mesures.append((angle, profils))
 
             if mesures:
-                self.analyser(dossier, ref, mesures, n, theorie)
+                self.analyser(dossier, ref, mesures, n, theorie, lasers)
         except (OSError, RuntimeError, ValueError) as exc:
             messagebox.showerror("Séquence", str(exc), parent=self.root)
         finally:
             self.occupation(False)
 
-    def analyser(self, dossier, ref, mesures, n_img, theorie=None):
+    def analyser(self, dossier, ref, mesures, n_img, theorie=None, lasers=None):
         npx = ref.shape[1]
-        lasers = self.lasers
+        lasers = self.lasers if lasers is None else lasers
         avertissement = []
         if lasers and lasers[0].largeur != npx:
             lasers = []
