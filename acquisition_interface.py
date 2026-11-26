@@ -21,15 +21,15 @@ from picamera2 import Picamera2
 
 
 DOSSIER_SORTIE = Path(__file__).resolve().parent / "acquisitions"
-DOSSIER_LASERS_PROFS = DOSSIER_SORTIE / "calibration" / "lasers"
+DOSSIER_LASERS_PROFS = DOSSIER_SORTIE / "calibration_lasers"
 DOSSIER_TXT_PROFS = DOSSIER_SORTIE.parent / "references_profs"
 
 ASSOCIATIONS_LASERS = {
     "532": ("532nm Laser (battery powered).txt", False),
-    "555": ("555nm Laser (battery powered).txt", False),
-    "571": ("571nm Laser (battery powered).txt", False),
-    "593": ("593nm Laser (battery powered).txt", False),
-    "650": ("635nm_laser_pointer_cat.txt", False),
+    "555": ("555nm laser (battery powered).txt", False),
+    "571": ("571nm laser (battery powered).txt", False),
+    "593": ("593nm laser (battery powered).txt", False),
+    "650": ("650nm_laser_pointer_cat.txt", False),
     # Ajoute les quatre autres lasers sur le même modèle.
     # "nom_du_dossier": ("nom_exact_du_fichier.txt", False),
 }
@@ -44,6 +44,9 @@ BLANC, NOIR = 4095, 256
 DEMI_H, LISS = 50, 5
 SEUIL_REF, FRAC = 0.10, 0.50
 N_BOOT, TAUX_MIN = 2000, 0.95
+# Pic laser saturé : flancs gardés au-dessus de 10 % du sommet écrêté,
+# alerte si le centre gaussien s'écarte du centroïde de plus de 0,5 px.
+FRAC_FLANC, ECART_MAX_PX = 0.10, 0.5
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,7 @@ class Laser:
     largeur: int
     verification: bool
     source: str
+    alerte: str = ""  # vide si le centre du pic est fiable
 
 
 def lisser(y, n=LISS):
@@ -137,9 +141,64 @@ def profil_laser(images):
     intensite = lisser(np.mean(profils, axis=0))
     px, g, d = pic(np.arange(intensite.size), intensite)
     demi_lissage = LISS // 2
-    if satures[max(0, g - demi_lissage):d + demi_lissage + 1].any():
-        raise ValueError("Pic laser saturé. Réduisez l’exposition puis recommencez.")
-    return px, intensite
+    if not satures[max(0, g - demi_lissage):d + demi_lissage + 1].any():
+        return px, intensite, ""
+
+    # Pic saturé : sommet écrêté. On ajuste une gaussienne sur les flancs
+    # non saturés (parabole sur le log), ce qui reconstruit le sommet.
+    try:
+        centre = centre_gaussien(np.mean(profils, axis=0), satures)
+    except ValueError as exc:
+        return px, intensite, (
+            f"pic saturé, ajustement gaussien impossible ({exc}). "
+            f"Centroïde utilisé : {px:.2f} px (biais possible)."
+        )
+    ecart = centre - px
+    alerte = ""
+    if abs(ecart) > ECART_MAX_PX:
+        alerte = (
+            f"pic saturé, centre gaussien {centre:.2f} px vs centroïde {px:.2f} px "
+            f"(écart {ecart:+.2f} px > {ECART_MAX_PX} px). Centre gaussien utilisé."
+        )
+    return centre, intensite, alerte
+
+
+def centre_gaussien(y, satures):
+    """Centre d'une gaussienne ajustée sur les colonnes non saturées du pic.
+
+    ln(y) est une parabole pour une gaussienne : on l'ajuste par moindres
+    carrés pondérés par y (les points faibles, bruités en log, comptent moins).
+    """
+    y = y - np.median(y)
+    i = int(np.argmax(y))
+    seuil = FRAC_FLANC * y[i]
+    g, d = i, i
+    while g > 0 and y[g - 1] >= seuil:
+        g -= 1
+    while d < len(y) - 1 and y[d + 1] >= seuil:
+        d += 1
+
+    cols = np.arange(g, d + 1)
+    bons = cols[~satures[g:d + 1] & (y[g:d + 1] > 0)]
+    zone_sat = cols[satures[g:d + 1]]
+    if zone_sat.size and not (
+        (bons < zone_sat.min()).any() and (bons > zone_sat.max()).any()
+    ):
+        raise ValueError("pas de flanc non saturé des deux côtés")
+    if bons.size < 3:
+        raise ValueError(f"seulement {bons.size} colonne(s) non saturée(s)")
+
+    a, b, _ = np.polyfit(bons, np.log(y[bons]), 2, w=y[bons])
+    if a >= 0:
+        raise ValueError("forme non gaussienne")
+    centre = -b / (2 * a)
+    if not g <= centre <= d:
+        raise ValueError("centre hors du pic")
+    return float(centre)
+
+
+def avertissements_pic(lasers):
+    return [f"ATTENTION : laser {p.nm:g} nm : {p.alerte}" for p in lasers if p.alerte]
 
 
 def axe_lbd(n, px_ref, lbd_ref_nm):
@@ -204,11 +263,11 @@ def charger_lasers_profs():
 
         try:
             nm = longueur_txt(txt)
-            px, intensite = profil_laser(np.load(f) for f in fichiers)
+            px, intensite, alerte = profil_laser(np.load(f) for f in fichiers)
         except (OSError, ValueError) as exc:
             raise ValueError(f"Laser {nom} · {txt.name} : {exc}") from exc
 
-        point = Laser(px, nm, intensite.size, verification, f"{nom} / {txt.name}")
+        point = Laser(px, nm, intensite.size, verification, f"{nom} / {txt.name}", alerte)
         lasers.append(point)
         dernier = (point, intensite)
 
@@ -471,8 +530,8 @@ class App:
                 Path(DOSSIER_SORTIE) / "calibration_lasers"
                 / datetime.now().strftime("laser_%Y%m%d_%H%M%S_%f")
             )
-            px, intensite = profil_laser(self.images(str(dossier), n))
-            laser = Laser(px, nm, intensite.size, verif, source)
+            px, intensite, alerte = profil_laser(self.images(str(dossier), n))
+            laser = Laser(px, nm, intensite.size, verif, source, alerte)
             nouveaux = self.lasers + [laser]
             verifier_lasers(nouveaux)
 
@@ -484,6 +543,14 @@ class App:
             self.afficher_calib((laser, intensite))
             self.nb.select(2)
             self.log(f"Laser {nm:g} nm enregistré au pixel {px:.2f}.")
+            if alerte:
+                self.log_pic([laser])
+                messagebox.showwarning(
+                    "Capture laser",
+                    f"{alerte}\nRaie enregistrée quand même. "
+                    "Pour un centre plus fiable, réduisez l’exposition et recommencez.",
+                    parent=self.root,
+                )
         except (OSError, RuntimeError, ValueError, tk.TclError) as exc:
             messagebox.showerror("Capture laser", str(exc), parent=self.root)
         finally:
@@ -502,6 +569,7 @@ class App:
                 self.afficher_calib(dernier)
                 self.nb.select(2)
                 self.log(f"{len(self.lasers)} lasers chargés depuis {dossier}.")
+                self.log_pic(self.lasers)
                 return
             nouveaux, dernier = [], None
             for d in [dossier] + sorted(p for p in dossier.iterdir() if p.is_dir()):
@@ -518,8 +586,8 @@ class App:
                 else:
                     continue
 
-                px, intensite = profil_laser(np.load(f) for f in fichiers)
-                laser = Laser(px, nm, intensite.size, verif, source)
+                px, intensite, alerte = profil_laser(np.load(f) for f in fichiers)
+                laser = Laser(px, nm, intensite.size, verif, source, alerte)
                 nouveaux.append(laser)
                 dernier = (laser, intensite)
 
@@ -528,6 +596,7 @@ class App:
             verifier_lasers(nouveaux)
             self.lasers = nouveaux
             self.afficher_calib(dernier)
+            self.log_pic(self.lasers)
             self.nb.select(2)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             messagebox.showerror("Dossier de calibration", str(exc), parent=self.root)
@@ -560,6 +629,7 @@ class App:
         self.lasers, dernier = resultat
         self.afficher_calib(dernier)
         self.log(f"Calibration chargée : {len(self.lasers)} lasers.")
+        self.log_pic(self.lasers)
 
     def calibration_pour_mesure(self):
         """Recharge la calibration avant une mesure en lumière blanche.
@@ -572,6 +642,7 @@ class App:
             self.lasers, dernier = resultat
             self.afficher_calib(dernier)
             self.log(f"Calibration rechargée : {len(self.lasers)} lasers.")
+            self.log_pic(self.lasers)
             return list(self.lasers)
 
         self.log("ERREUR : calibration non chargée.")
@@ -586,6 +657,10 @@ class App:
             return None
         self.log("ATTENTION : mesure lancée sans calibration.")
         return []
+
+    def log_pic(self, lasers):
+        for ligne in avertissements_pic(lasers):
+            self.log(ligne)
 
     def sans_calib(self):
         self.lasers = []
@@ -628,6 +703,7 @@ class App:
             bas.legend(fontsize=8)
             ecarts = ecarts_verification(x, self.lasers)
             lignes.extend(resume_verification(ecarts, incertitude_calibration(ecarts)))
+            lignes.extend(avertissements_pic(self.lasers))
 
         bas.set(xlabel="Pixel binné", ylabel="Longueur d’onde (nm)")
         self.fig_cal.tight_layout()
@@ -855,7 +931,10 @@ class App:
         ecarts = ecarts_verification(x, lasers)
         u_cal = incertitude_calibration(ecarts)
         raies = [nm for nm, _ in ecarts]
-        lignes = [f"Étalonnage : {desc}"] + avertissement + resume_verification(ecarts, u_cal)
+        lignes = (
+            [f"Étalonnage : {desc}"] + avertissement
+            + avertissements_pic(lasers) + resume_verification(ecarts, u_cal)
+        )
         if u_cal is None:
             lignes.append("Barres : répétabilité seule (± une incertitude-type).")
         elif len(raies) == 1:
