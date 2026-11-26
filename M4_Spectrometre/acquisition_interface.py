@@ -16,8 +16,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from picamera2 import Picamera2
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+try:
+    from picamera2 import Picamera2
+except ImportError:  # ordinateur sans Raspberry Pi : mode relecture seulement
+    Picamera2 = None
 
 
 DOSSIER_SORTIE = Path(__file__).resolve().parent / "acquisitions"
@@ -43,7 +47,6 @@ LBD_C, SENS = 550e-9, -1
 BLANC, NOIR = 4095, 256
 DEMI_H, LISS = 50, 5
 SEUIL_REF, FRAC = 0.10, 0.50
-N_BOOT, TAUX_MIN = 2000, 0.95
 # Pic laser saturé : flancs gardés au-dessus de 10 % du sommet écrêté,
 # alerte si le centre gaussien s'écarte du centroïde de plus de 0,5 px.
 FRAC_FLANC, ECART_MAX_PX = 0.10, 0.5
@@ -162,6 +165,16 @@ def profil_laser(images):
         )
     return centre, intensite, alerte
 
+def profils_dossier(dossier, noir, bande):
+    """Profils de tous les raw_*.npy d'un dossier, corrigés du noir."""
+    fichiers = sorted(Path(dossier).glob("raw_*.npy"))
+    if not fichiers:
+        raise ValueError(f"Aucun raw_*.npy dans {dossier}")
+    profs = []
+    for f in fichiers:
+        p, bande = profil(np.load(f), noir, bande)
+        profs.append(p)
+    return np.array(profs), bande
 
 def centre_gaussien(y, satures):
     """Centre d'une gaussienne ajustée sur les colonnes non saturées du pic.
@@ -285,6 +298,22 @@ def calibrer(n, lasers):
         return axe_lbd(n, *pts[0]), f"modèle calé sur {pts[0][1]:g} nm"
     return axe_lbd(n, n / 2, LBD_C * 1e9), "axe nominal (550 nm au centre)"
 
+def sigma_axe(n, lasers):
+    """Incertitude-type (nm) de la droite d'étalonnage en chaque pixel.
+
+    Renvoie None s'il y a moins de 3 raies d'ajustement (pas de degré de
+    liberté pour estimer la dispersion autour de la droite).
+    """
+    pts = [(p.px, p.nm) for p in lasers if not p.verification]
+    if len(pts) < 3:
+        return None
+    px, nm = (np.array(v, dtype=float) for v in zip(*pts))
+    X = np.column_stack([px, np.ones_like(px)])
+    beta, *_ = np.linalg.lstsq(X, nm, rcond=None)
+    r = nm - X @ beta
+    cov = (r @ r / (len(pts) - 2)) * np.linalg.inv(X.T @ X)  # cov de (a, b)
+    G = np.column_stack([np.arange(n), np.ones(n)])
+    return np.sqrt(np.einsum("ij,jk,ik->i", G, cov, G))
 
 def ecarts_verification(x, lasers):
     if not any(not p.verification for p in lasers):
@@ -296,6 +325,19 @@ def ecarts_verification(x, lasers):
 def incertitude_calibration(ecarts):
     return np.sqrt(np.mean([e**2 for _, e in ecarts])) if ecarts else None
 
+def formater(c, u):
+    """Valeur et incertitude avec 1 chiffre significatif sur u.
+
+    Les décimales de c sont alignées sur celles de u.
+    """
+    if u is None or not np.isfinite(u) or u <= 0:
+        return f"{c:.2f} nm"
+    exposant = int(np.floor(np.log10(u)))
+    u1 = round(u, -exposant)          # arrondi à 1 chiffre significatif
+    if u1 >= 10 ** (exposant + 1):    # ex. 0.96 -> 1.0 : exposant augmenté
+        exposant += 1
+    decimales = max(0, -exposant)
+    return f"({c:.{decimales}f} ± {u1:.{decimales}f}) nm"
 
 def resume_verification(ecarts, u_cal):
     if u_cal is None:
@@ -333,28 +375,23 @@ def coupures(x, T):
         interpole(descendantes[-1]) if descendantes.size else None,
     ), niveau
 
-
-def bootstrap(x, ordre, ref, mes):
-    """Écarts-types des coupures, sous hypothèse d’images indépendantes."""
-    nr, nm = len(ref), len(mes)
-    if min(nr, nm) < 2:
+def repetabilite(x, ordre, ref, mes):
+    """Incertitude-type (nm) sur la moyenne des coupures, paire par paire."""
+    n = min(len(ref), len(mes))
+    if n < 2:
         return [(None, None), (None, None)]
 
-    rng = np.random.default_rng(3910)
+    xc = x[ordre]
     valeurs = [[], []]
-    x_croissant = x[ordre]
-    for _ in range(N_BOOT):
-        ref_b = ref[rng.integers(nr, size=nr)]
-        mes_b = mes[rng.integers(nm, size=nm)]
-        _, T = transmission(ref_b, mes_b)
-        centres, _ = coupures(x_croissant, T[ordre])
+    for k in range(n):
+        _, T = transmission(ref[k:k + 1], mes[k:k + 1])
+        centres, _ = coupures(xc, T[ordre])
         for serie, c in zip(valeurs, centres):
             if c is not None:
                 serie.append(c)
 
-    return [(np.std(v, ddof=1) if len(v) >= TAUX_MIN * N_BOOT else None, len(v))
+    return [(np.std(v, ddof=1) / np.sqrt(n) if len(v) == n else None, len(v))
             for v in valeurs]
-
 
 class App:
     def __init__(self, root):
@@ -364,8 +401,8 @@ class App:
         # obscurité, lumière blanche sans filtre et avec filtre), il reste en direct.
         self.en_capture = False
         self.expo = tk.DoubleVar(value=EXPO_MS)
-        self.n_img = tk.IntVar(value=5)
-        self.n_ang = tk.IntVar(value=3)
+        self.n_img = tk.IntVar(value=1)
+        self.n_ang = tk.IntVar(value=1)
         self.coupure_theo = tk.StringVar()
         self.u_coupure_theo = tk.StringVar()
         self.calib_txt = tk.StringVar(value="Aucune raie enregistrée")
@@ -375,6 +412,10 @@ class App:
         self.commandes = []
 
         root.title("Spectromètre — acquisition")
+        self.u_ang = tk.DoubleVar(value=0.5)   # incertitude sur l'angle (°)
+        self.vue = tk.StringVar(value="spectres")
+        self.pts_angle = []                    # (angle, nom, coupure, u)
+        self.theorie = None
         self.construire()
         self.demarrer_camera()
         root.after_idle(self.calibration_demarrage)
@@ -409,6 +450,11 @@ class App:
             wraplength=225,
         ).pack(anchor="w", pady=(0, 6))
         reglage(blanc, "Nombre d’angles", self.n_ang, 1, 20)
+        ttk.Label(blanc, text="Incertitude angle ± (°)").pack(anchor="w")
+        ttk.Spinbox(
+            blanc, from_=0, to=10, increment=0.1, textvariable=self.u_ang,
+            width=8, command=self.tracer_angle,
+        ).pack(anchor="w", pady=(0, 4))
         ttk.Label(blanc, text="Coupure théorique (nm, facultative)").pack(anchor="w")
         ttk.Entry(blanc, textvariable=self.coupure_theo, width=12).pack(
             anchor="w", pady=(0, 4)
@@ -418,6 +464,7 @@ class App:
             anchor="w", pady=(0, 6)
         )
         bouton(blanc, "Mesurer la transmission", self.sequence)
+        bouton(blanc, "Charger une acquisition (dossier)…", self.charger_acquisition)
 
         ttk.Label(laser, text="Longueur d’onde du laser (nm)").pack(anchor="w")
         ttk.Entry(laser, textvariable=self.laser_nm, width=12).pack(
@@ -443,6 +490,7 @@ class App:
         self.log_w = ScrolledText(g, width=31, height=4, state="disabled")
         self.log_w.pack(fill="both", expand=True)
 
+        # ---------------- Onglets de droite ----------------
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(side="right", fill="both", expand=True)
         t1, t2, t3 = (ttk.Frame(self.nb) for _ in range(3))
@@ -450,15 +498,42 @@ class App:
         self.nb.add(t2, text="Transmission")
         self.nb.add(t3, text="Étalonnage")
 
+        # Onglet Aperçu
         self.lbl = ttk.Label(t1)
         self.lbl.pack()
 
-        self.fig = Figure(figsize=(7, 4.2), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=t2)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.res = ScrolledText(t2, height=8, wrap="word")
-        self.res.pack(fill="x")
+        # Onglet Transmission : boutons de vue en haut, texte en bas,
+        # graphique (avec barre de zoom) au milieu
+        barre_vue = ttk.Frame(t2)
+        barre_vue.pack(side="top", fill="x")
+        for texte, valeur in (("Spectres", "spectres"), ("Coupure vs angle", "angle")):
+            ttk.Radiobutton(
+                barre_vue, text=texte, value=valeur,
+                variable=self.vue, command=self.changer_vue,
+            ).pack(side="left", padx=4)
 
+        self.res = ScrolledText(t2, height=8, wrap="word")
+        self.res.pack(side="bottom", fill="x")
+
+        # Vue « Spectres »
+        self.zone_spec = ttk.Frame(t2)
+        self.zone_spec.pack(fill="both", expand=True)
+        self.fig = Figure(figsize=(7, 4.2), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.zone_spec)
+        self.barre = NavigationToolbar2Tk(
+            self.canvas, self.zone_spec, pack_toolbar=False
+        )
+        self.barre.update()
+        self.barre.pack(side="bottom", fill="x")
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Vue « Coupure vs angle » (cachée au départ)
+        self.zone_ang = ttk.Frame(t2)
+        self.fig_ang = Figure(figsize=(7, 4.2), dpi=100)
+        self.canvas_ang = FigureCanvasTkAgg(self.fig_ang, master=self.zone_ang)
+        self.canvas_ang.get_tk_widget().pack(fill="both", expand=True)
+
+        # Onglet Étalonnage
         self.fig_cal = Figure(figsize=(7, 4.2), dpi=100)
         self.canvas_cal = FigureCanvasTkAgg(self.fig_cal, master=t3)
         self.canvas_cal.get_tk_widget().pack(fill="both", expand=True)
@@ -495,6 +570,9 @@ class App:
             messagebox.showerror("Spectre de référence", str(exc), parent=self.root)
 
     def ajouter_laser(self):
+        if self.cam is None:
+            messagebox.showinfo("Caméra", "Pas de caméra : utilisez « Charger une acquisition ».", parent=self.root)
+            return
         try:
             texte = self.laser_nm.get()
             nm = float(texte.strip().replace(",", "."))
@@ -672,22 +750,23 @@ class App:
             f"Raies : {len(self.lasers) - n_verif} ajustement, {n_verif} vérification"
         )
         self.fig_cal.clear()
-        haut, bas = self.fig_cal.subplots(2, 1)
+        bas = self.fig_cal.subplots()
         lignes = []
-
-        if mesure is not None:
-            laser, intensite = mesure
-            haut.plot(intensite)
-            haut.axvline(
-                laser.px, ls="--", color="tab:orange",
-                label=f"{laser.nm:g} nm → {laser.px:.2f} px",
-            )
-            haut.legend(fontsize=8)
-        haut.set(xlabel="Pixel binné", ylabel="Intensité RAW")
 
         if self.lasers:
             x, desc = calibrer(self.lasers[0].largeur, self.lasers)
             bas.plot(x, color="0.5", label=desc)
+
+            s = sigma_axe(self.lasers[0].largeur, self.lasers)
+            if s is not None:
+                bas.fill_between(
+                    np.arange(len(x)), x - s, x + s,
+                    color="tab:blue", alpha=0.2, label="Incertitude régression (±1σ)",
+                )
+                lignes.append(
+                    f"Incertitude de régression : ±{s.min():.2f} à ±{s.max():.2f} nm (k=1)."
+                )
+
             for verif, couleur, nom in (
                 (False, "tab:blue", "Ajustement"),
                 (True, "tab:orange", "Vérification"),
@@ -696,6 +775,15 @@ class App:
                 if pts:
                     bas.scatter([p.px for p in pts], [p.nm for p in pts],
                                 color=couleur, label=nom)
+                    for p in pts:
+                        bas.annotate(
+                            f"{p.nm:g} nm",
+                            (p.px, p.nm),
+                            textcoords="offset points",
+                            xytext=(6, -12),
+                            fontsize=8,
+                            color=couleur,
+                        )
                     lignes.extend(
                         f"{nom}  {p.nm:g} nm  |  {p.px:.2f} px  |  {p.source}"
                         for p in pts
@@ -712,6 +800,11 @@ class App:
         self.res_cal.insert("end", "\n".join(lignes))
 
     def demarrer_camera(self):
+        if Picamera2 is None:
+            self.cam, self.taille = None, None
+            self.log("Mode sans caméra : seul « Charger une acquisition » fonctionne.")
+            self.lbl.config(text="Aucune caméra détectée", font=("TkDefaultFont", 14))
+            return
         cam = Picamera2()
         taille = tuple(cam.sensor_resolution)
         modes = [m for m in cam.sensor_modes if tuple(m["size"]) == taille] or list(cam.sensor_modes)
@@ -747,13 +840,16 @@ class App:
 
         ms = min(max(ms, 0.1), 1000 / FPS * 0.95)
         self.expo.set(ms)
-        self.cam.set_controls({"ExposureTime": int(ms * 1000)})
-        for _ in range(4):
-            self.cam.capture_metadata()
+        if self.cam is not None:
+            self.cam.set_controls({"ExposureTime": int(ms * 1000)})
+            for _ in range(4):
+                self.cam.capture_metadata()
         self.log(f"Exposition : {ms:.1f} ms")
         return True
 
     def apercu(self):
+        if self.cam is None:
+            return
         if not self.en_capture:
             try:
                 rgb = cv2.cvtColor(
@@ -831,6 +927,9 @@ class App:
         return nm, u
     
     def sequence(self):
+        if self.cam is None:
+            messagebox.showinfo("Caméra", "Pas de caméra : utilisez « Charger une acquisition ».", parent=self.root)
+            return
         try:
             n, na = self.n_img.get(), self.n_ang.get()
             if not (1 <= n <= 50 and 1 <= na <= 20):
@@ -930,20 +1029,27 @@ class App:
         ordre = np.argsort(x)
         ecarts = ecarts_verification(x, lasers)
         u_cal = incertitude_calibration(ecarts)
+        s_reg = sigma_axe(npx, lasers)
         raies = [nm for nm, _ in ecarts]
         lignes = (
             [f"Étalonnage : {desc}"] + avertissement
             + avertissements_pic(lasers) + resume_verification(ecarts, u_cal)
         )
-        if u_cal is None:
-            lignes.append("Barres : répétabilité seule (± une incertitude-type).")
-        elif len(raies) == 1:
+        lignes.append(
+            "Barres : incertitude-type (k=1) combinant répétabilité, vérification "
+            "(u_cal) et régression (u_reg), quand disponibles."
+        )
+        if len(raies) == 1:
+            lignes.append("Une seule raie de vérification. L’estimation de u_cal est indicative.")
+        if len(raies) == 1:
             lignes.append("Une seule raie de vérification. L’estimation de u_cal est indicative.")
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         i_ref, _ = transmission(ref, mesures[0][1])
         colonnes, entete = [x, i_ref], "lbd_nm,I_ref"
+
+        pts_ang = []
 
         for a, profs in mesures:
             _, T = transmission(ref, profs)
@@ -952,32 +1058,38 @@ class App:
             lignes.append(f"θ = {a:g}°")
             txt = []
             incertitudes = (
-                bootstrap(x, ordre, ref, profs) if any(c is not None for c in centres) else []
+                repetabilite(x, ordre, ref, profs) if any(c is not None for c in centres) else []
             )
 
             for nom, c, (u_stat, nb) in zip(
-                ("montante", "descendante"), centres, incertitudes
-            ):
+                ("montante", "descendante"), centres, incertitudes):
                 if c is None:
                     continue
 
-                u = None
-                if u_stat is None:
-                    valeur = f"{c:.2f} nm"
-                    detail = (
-                        "répétabilité indisponible : au moins 2 images par série"
-                        if nb is None else f"coupure instable : {nb}/{N_BOOT} tirages"
-                    )
+                # u_reg à la position de la coupure (interpolé sur l'axe croissant)
+                u_reg = (float(np.interp(c, x[ordre], s_reg[ordre]))
+                        if s_reg is not None else None)
+                parts = [v for v in (u_stat, u_cal, u_reg) if v is not None]
+                u = float(np.sqrt(sum(v**2 for v in parts))) if parts else None
+                pts_ang.append((a, nom, c, u))
+
+
+                valeur = formater(c, u)
+
+                detail = []
+                n_paires = min(len(ref), len(profs))
+                if u_stat is not None:
+                    detail.append(f"u_rép = {u_stat:.3g} nm (σ/√{n_paires}, {n_paires} paires)")
+                elif nb is None:
+                    detail.append("répétabilité indisponible : au moins 2 images par série")
                 else:
-                    u = u_stat if u_cal is None else np.hypot(u_stat, u_cal)
-                    valeur = f"({c:.2f} ± {u:.3g}) nm"
-                    detail = f"u_rép = {u_stat:.3g} nm, {nb}/{N_BOOT} tirages"
-                    if raies and not min(raies) <= c <= max(raies):
-                        detail += ", hors de la plage des raies de vérification"
+                    detail.append(f"coupure introuvable sur {n_paires - nb}/{n_paires} paires")
 
                 txt.append(valeur)
-                lignes.append(f"    {nom} : {valeur} ({detail})")
+                lignes.append(f"    {nom} : {valeur} ({', '.join(detail)})")
                 ax.axvline(c, color=ligne.get_color(), ls="--", lw=0.7)
+                if u is not None:
+                    ax.axvspan(c - u, c + u, color=ligne.get_color(), alpha=0.15, zorder=0)
                 ax.errorbar(c, niveau, xerr=u, fmt="o", color=ligne.get_color(), capsize=4)
 
             if not txt:
@@ -1006,6 +1118,14 @@ class App:
         self.fig.tight_layout()
         self.canvas.draw()
 
+        self.barre.update()
+
+        self.pts_angle, self.theorie = pts_ang, theorie
+        self.log(f"Points coupure vs angle : {len(pts_ang)}")
+        self.tracer_angle()
+
+        self.fig_ang.savefig(os.path.join(dossier, "coupure_vs_angle.png"), dpi=150)
+
         self.fig.savefig(os.path.join(dossier, "transmission.png"), dpi=150)
         np.savetxt(
             os.path.join(dossier, "transmission.csv"), np.column_stack(colonnes),
@@ -1016,7 +1136,7 @@ class App:
             f"Images par acquisition : {n_img}",
             f"RAW : {BLANC + 1} niveaux, noir = dark",
             f"Coupure : {FRAC:.0%} du 99e percentile de T valide",
-            f"Bootstrap : {N_BOOT} tirages, seuil de stabilité {TAUX_MIN:.0%}",
+            f"Répétabilité : écart-type des coupures par paire d'images, divisé par √N",
             "Barres horizontales : incertitude-type (k=1)",
         ]
         Path(dossier, "parametres.txt").write_text(
@@ -1031,11 +1151,102 @@ class App:
         if self.occupe:
             return
         try:
-            self.cam.stop()
-            self.cam.close()
+            if self.cam is not None:
+                self.cam.stop()
+                self.cam.close()
         finally:
             self.root.destroy()
 
+    def charger_acquisition(self):
+        """Relit un dossier d'acquisition (dark/, reference/, mesure_XX_YYdeg/)
+        et relance l'analyse sans caméra."""
+        chemin = filedialog.askdirectory(
+            parent=self.root, title="Dossier d'acquisition (contient dark/, reference/, mesure_*)"
+        )
+        if not chemin:
+            return
+        dossier = Path(chemin)
+
+        self.occupation(True)
+        try:
+            theorie = self.lire_coupure_theorique()
+
+            dark = sorted((dossier / "dark").glob("raw_*.npy"))
+            if not dark:
+                raise ValueError("Sous-dossier dark/ absent ou sans raw_*.npy.")
+            noir = sum(np.load(f).astype(np.float32) for f in dark) / len(dark)
+
+            ref, bande = profils_dossier(dossier / "reference", noir, None)
+
+            mesures = []
+            for d in sorted(dossier.glob("mesure_*")):
+                m = re.search(r"_(-?\d+(?:\.\d+)?)deg$", d.name)
+                if not d.is_dir() or not m:
+                    continue
+                profs, _ = profils_dossier(d, noir, bande)
+                mesures.append((float(m.group(1)), profs))
+            if not mesures:
+                raise ValueError("Aucun dossier mesure_XX_YYdeg trouvé.")
+
+            lasers = self.calibration_pour_mesure()
+            if lasers is None:
+                return
+
+            # Résultats écrits dans un sous-dossier pour ne rien écraser
+            sortie = dossier / "relecture"
+            sortie.mkdir(exist_ok=True)
+            self.analyser(str(sortie), ref, mesures, len(ref), theorie, lasers)
+            self.log(f"Acquisition relue : {len(mesures)} angle(s), {len(ref)} image(s).")
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Chargement", f"{type(exc).__name__} : {exc}", parent=self.root)
+        finally:
+            self.occupation(False)
+
+    def changer_vue(self):
+        spectres = self.vue.get() == "spectres"
+        (self.zone_ang if spectres else self.zone_spec).pack_forget()
+        (self.zone_spec if spectres else self.zone_ang).pack(fill="both", expand=True)
+        if not spectres:
+            self.tracer_angle()
+
+    def tracer_angle(self):
+        try:
+            ua = float(self.u_ang.get())
+        except (ValueError, tk.TclError):
+            ua = 0.5
+        self.fig_ang.clear()
+        ax = self.fig_ang.add_subplot(111)
+
+        for nom, couleur in (("montante", "tab:blue"), ("descendante", "tab:red")):
+            pts = sorted((a, c, 0 if u is None else u)
+                        for a, n, c, u in self.pts_angle if n == nom)
+            if not pts:
+                continue
+            a, c, u = (np.array(v) for v in zip(*pts))
+            ax.errorbar(a, c, xerr=ua, yerr=u, fmt="o", color=couleur,
+                        capsize=4, label=f"Coupure {nom}")
+            ax.fill_between(a, c - u, c + u, color=couleur, alpha=0.12)
+
+        if self.theorie is not None:
+            nm, u_theo = self.theorie
+            label = (f"Coupure théorique : {nm:g} nm" if not u_theo
+                    else f"Coupure théorique : ({nm:g} ± {u_theo:g}) nm")
+            if u_theo:
+                ax.axhspan(nm - u_theo, nm + u_theo, color="0.2", alpha=0.13, zorder=0)
+            ax.axhline(nm, color="0.2", ls=":", lw=1.5, label=label)
+
+        if not self.pts_angle:
+            ax.text(0.5, 0.5, "Aucune coupure mesurée", ha="center", va="center",
+                    transform=ax.transAxes)
+        ax.set_xlabel(f"Angle d’incidence (°)  —  incertitude ± {ua:g}°")
+        ax.set_ylabel("Longueur d’onde de coupure (nm)")
+        ax.grid(alpha=0.3)
+        if self.pts_angle or self.theorie is not None:
+            ax.legend(fontsize=8)
+        self.fig_ang.tight_layout()
+        self.canvas_ang.draw_idle()
 
 if __name__ == "__main__":
     root = tk.Tk()
