@@ -28,6 +28,7 @@ DOSSIER_SORTIE = Path(__file__).resolve().parent / "acquisitions"
 DOSSIER_LASERS_PROFS = DOSSIER_SORTIE / "calibration_lasers"
 DOSSIER_TXT_PROFS = DOSSIER_SORTIE.parent / "references_profs"
 
+# Ancien format (dossiers des profs sans laser.json) : dossier -> (TXT, vérification?)
 ASSOCIATIONS_LASERS = {
     "532": ("532nm Laser (battery powered).txt", False),
     "555": ("555nm laser (battery powered).txt", False),
@@ -51,6 +52,11 @@ SEUIL_REF, FRAC = 0.10, 0.50
 # alerte si le centre gaussien s'écarte du centroïde de plus de 0,5 px.
 FRAC_FLANC, ECART_MAX_PX = 0.10, 0.5
 
+# Incertitude sur le pic du spectromètre de référence (à ajuster selon sa résolution)
+U_NM_REF = 0.133      # nm
+# Plancher sur le centre d'un pic (méthode de centroïde, quantification)
+U_PX_MIN = 0.1      # px binné
+
 
 @dataclass(frozen=True)
 class Laser:
@@ -60,6 +66,9 @@ class Laser:
     verification: bool
     source: str
     alerte: str = ""  # vide si le centre du pic est fiable
+    u_px: float = U_PX_MIN
+    u_nm: float = U_NM_REF
+    n_acq: int = 1
 
 
 def lisser(y, n=LISS):
@@ -165,6 +174,7 @@ def profil_laser(images):
         )
     return centre, intensite, alerte
 
+
 def profils_dossier(dossier, noir, bande):
     """Profils de tous les raw_*.npy d'un dossier, corrigés du noir."""
     fichiers = sorted(Path(dossier).glob("raw_*.npy"))
@@ -175,6 +185,7 @@ def profils_dossier(dossier, noir, bande):
         p, bande = profil(np.load(f), noir, bande)
         profs.append(p)
     return np.array(profs), bande
+
 
 def centre_gaussien(y, satures):
     """Centre d'une gaussienne ajustée sur les colonnes non saturées du pic.
@@ -237,83 +248,146 @@ def verifier_lasers(lasers):
     if ecarts.size and not (np.all(ecarts > 0) or np.all(ecarts < 0)):
         raise ValueError("Les raies d’ajustement doivent être ordonnées le long du capteur.")
 
-def charger_lasers_profs():
-    if not ASSOCIATIONS_LASERS:
-        raise ValueError("Renseignez ASSOCIATIONS_LASERS dans le script.")
 
-    def contenu(d, motif="*"):
-        noms = sorted(f.name for f in d.glob(motif))
-        return ", ".join(noms) if noms else "(vide)"
+# ---------------------------------------------------------------------------
+# Calibration : dossiers de lasers, acquisitions multiples
+# ---------------------------------------------------------------------------
 
-    for d, quoi in ((DOSSIER_LASERS_PROFS, "des RAW lasers"), (DOSSIER_TXT_PROFS, "des TXT lasers")):
-        if not d.is_dir():
-            raise FileNotFoundError(f"Dossier {quoi} introuvable :\n{d}")
+def nom_dossier_laser(nm):
+    return f"{nm:.0f}"          # 532.03 -> "532"
 
+
+def acquisitions_laser(dossier):
+    """Liste de listes de fichiers RAW : une liste par acquisition (acq_*).
+    Ancien format (raw_*.npy directement dans le dossier) = 1 acquisition."""
+    d = Path(dossier)
+    acqs = sorted(p for p in d.glob("acq_*") if p.is_dir()) or [d]
+    res = []
+    for a in acqs:
+        fichiers = sorted(a.glob("raw_*.npy"))
+        if not fichiers and (a / "raw.npy").is_file():
+            fichiers = [a / "raw.npy"]
+        if fichiers:
+            res.append(fichiers)
+    return res
+
+
+def laser_depuis_dossier(d):
+    """Construit un Laser (moyenne de toutes les acquisitions du dossier).
+    Renvoie (Laser, intensite) ou None si le dossier n'est pas un laser."""
+    d = Path(d)
+    meta = d / "laser.json"
+    if meta.is_file():
+        infos = json.loads(meta.read_text(encoding="utf-8"))
+        nm, verif = float(infos["nm"]), bool(infos["verification"])
+        source = f"{d.name} / {infos.get('txt', 'saisie manuelle')}"
+    elif d.name in ASSOCIATIONS_LASERS:            # ancien format des profs
+        nom_txt, verif = ASSOCIATIONS_LASERS[d.name]
+        nm = longueur_txt(DOSSIER_TXT_PROFS / nom_txt)
+        source = f"{d.name} / {nom_txt}"
+    else:
+        return None
+
+    acqs = acquisitions_laser(d)
+    if not acqs:
+        raise ValueError(f"aucun raw_*.npy dans {d}")
+
+    centres, alertes, intensite = [], [], None
+    for i, fichiers in enumerate(acqs, 1):
+        px, intensite, alerte = profil_laser(np.load(f) for f in fichiers)
+        centres.append(px)
+        if alerte:
+            alertes.append(f"acq {i} : {alerte}")
+
+    n = len(centres)
+    u_stat = np.std(centres, ddof=1) / np.sqrt(n) if n >= 2 else 0.0
+    u_px = float(np.hypot(u_stat, U_PX_MIN))
+    laser = Laser(float(np.mean(centres)), nm, intensite.size, verif, source,
+                  " | ".join(alertes), u_px, U_NM_REF, n)
+    return laser, intensite
+
+
+def charger_calibration_dossier(racine):
+    """Charge tous les sous-dossiers laser d'un dossier de calibration."""
+    racine = Path(racine)
+    if not racine.is_dir():
+        raise FileNotFoundError(f"Dossier de calibration introuvable :\n{racine}")
     lasers, dernier = [], None
-    for nom, (nom_txt, verification) in ASSOCIATIONS_LASERS.items():
-        dossier = DOSSIER_LASERS_PROFS / nom
-        txt = DOSSIER_TXT_PROFS / nom_txt
-
-        if not dossier.is_dir():
-            raise FileNotFoundError(
-                f"Laser {nom} : dossier absent\n{dossier}\n"
-                f"Sous-dossiers présents : {contenu(DOSSIER_LASERS_PROFS)}"
-            )
-        if not txt.is_file():
-            raise FileNotFoundError(
-                f"Laser {nom} : fichier TXT absent\n{txt}\n"
-                f"TXT présents : {contenu(DOSSIER_TXT_PROFS, '*.txt')}"
-            )
-
-        fichiers = sorted(dossier.glob("raw_*.npy"))
-        if not fichiers and (dossier / "raw.npy").is_file():
-            fichiers = [dossier / "raw.npy"]
-        if not fichiers:
-            raise FileNotFoundError(
-                f"Laser {nom} : aucun raw.npy ou raw_*.npy dans\n{dossier}\n"
-                f"Fichiers présents : {contenu(dossier)}"
-            )
-
+    for d in sorted(p for p in racine.iterdir() if p.is_dir()):
         try:
-            nm = longueur_txt(txt)
-            px, intensite, alerte = profil_laser(np.load(f) for f in fichiers)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"Laser {nom} · {txt.name} : {exc}") from exc
-
-        point = Laser(px, nm, intensite.size, verification, f"{nom} / {txt.name}", alerte)
-        lasers.append(point)
-        dernier = (point, intensite)
-
+            r = laser_depuis_dossier(d)
+        except (OSError, ValueError, KeyError) as exc:
+            raise ValueError(f"Laser {d.name} : {exc}") from exc
+        if r is not None:
+            lasers.append(r[0])
+            dernier = r
     verifier_lasers(lasers)
-    if all(point.verification for point in lasers):
-        raise ValueError("Affectez au moins un laser à l’ajustement avec False.")
     return lasers, dernier
 
+
+def charger_lasers_profs(racine=None):
+    """Version « stricte » utilisée au démarrage et avant chaque mesure."""
+    lasers, dernier = charger_calibration_dossier(racine or DOSSIER_LASERS_PROFS)
+    if not lasers:
+        raise ValueError("Aucun laser reconnu dans le dossier de calibration.")
+    if all(p.verification for p in lasers):
+        raise ValueError("Affectez au moins un laser à l’ajustement (vérification décochée).")
+    return lasers, dernier
+
+
+def ajustement(lasers):
+    """nm = a·px + b, moindres carrés pondérés. -> (a, b, cov, chi2_red) ou None.
+
+    Chaque raie a une variance effective σ² = u_nm² + (a·u_px)² (incertitudes
+    en px et en nm ramenées sur nm). cov est la covariance de (a, b),
+    mise à l'échelle par χ²_red si χ²_red > 1.
+    """
+    pts = [p for p in lasers if not p.verification]
+    if len(pts) < 2:
+        return None
+    px = np.array([p.px for p in pts])
+    nm = np.array([p.nm for p in pts])
+    upx = np.array([p.u_px for p in pts])
+    unm = np.array([p.u_nm for p in pts])
+    X = np.column_stack([px, np.ones_like(px)])
+    a = np.polyfit(px, nm, 1)[0]
+    for _ in range(5):                                  # variance effective itérée
+        sig = np.maximum(np.sqrt(unm**2 + (a * upx)**2), 1e-9)
+        W = 1 / sig**2
+        cov = np.linalg.inv(X.T @ (X * W[:, None]))
+        a, b = cov @ (X.T @ (W * nm))
+    dof = len(pts) - 2
+    chi2r = float(np.sum(((nm - X @ np.array([a, b])) / sig)**2) / dof) if dof > 0 else None
+    if chi2r is not None and chi2r > 1:
+        cov = cov * chi2r
+    return a, b, cov, chi2r
+
+
 def calibrer(n, lasers):
+    fit = ajustement(lasers)
+    if fit is not None:
+        a, b, _, chi2r = fit
+        k = sum(not p.verification for p in lasers)
+        extra = f", χ²red = {chi2r:.2f}" if chi2r is not None else ""
+        return a * np.arange(n) + b, f"linéaire pondérée sur {k} raies ({a:.4f} nm/px{extra})"
     pts = [(p.px, p.nm) for p in lasers if not p.verification]
-    if len(pts) >= 2:
-        a, b = np.polyfit(*zip(*pts), 1)
-        return a * np.arange(n) + b, f"linéaire sur {len(pts)} raies ({a:.4f} nm/px)"
     if len(pts) == 1:
         return axe_lbd(n, *pts[0]), f"modèle calé sur {pts[0][1]:g} nm"
     return axe_lbd(n, n / 2, LBD_C * 1e9), "axe nominal (550 nm au centre)"
 
+
 def sigma_axe(n, lasers):
     """Incertitude-type (nm) de la droite d'étalonnage en chaque pixel.
 
-    Renvoie None s'il y a moins de 3 raies d'ajustement (pas de degré de
-    liberté pour estimer la dispersion autour de la droite).
+    Renvoie None s'il y a moins de 2 raies d'ajustement.
     """
-    pts = [(p.px, p.nm) for p in lasers if not p.verification]
-    if len(pts) < 3:
+    fit = ajustement(lasers)
+    if fit is None:
         return None
-    px, nm = (np.array(v, dtype=float) for v in zip(*pts))
-    X = np.column_stack([px, np.ones_like(px)])
-    beta, *_ = np.linalg.lstsq(X, nm, rcond=None)
-    r = nm - X @ beta
-    cov = (r @ r / (len(pts) - 2)) * np.linalg.inv(X.T @ X)  # cov de (a, b)
+    cov = fit[2]
     G = np.column_stack([np.arange(n), np.ones(n)])
     return np.sqrt(np.einsum("ij,jk,ik->i", G, cov, G))
+
 
 def ecarts_verification(x, lasers):
     if not any(not p.verification for p in lasers):
@@ -324,6 +398,7 @@ def ecarts_verification(x, lasers):
 
 def incertitude_calibration(ecarts):
     return np.sqrt(np.mean([e**2 for _, e in ecarts])) if ecarts else None
+
 
 def formater(c, u):
     """Valeur et incertitude avec 1 chiffre significatif sur u.
@@ -338,6 +413,7 @@ def formater(c, u):
         exposant += 1
     decimales = max(0, -exposant)
     return f"({c:.{decimales}f} ± {u1:.{decimales}f}) nm"
+
 
 def resume_verification(ecarts, u_cal):
     if u_cal is None:
@@ -375,6 +451,7 @@ def coupures(x, T):
         interpole(descendantes[-1]) if descendantes.size else None,
     ), niveau
 
+
 def repetabilite(x, ordre, ref, mes):
     """Incertitude-type (nm) sur la moyenne des coupures, paire par paire."""
     n = min(len(ref), len(mes))
@@ -393,6 +470,7 @@ def repetabilite(x, ordre, ref, mes):
     return [(np.std(v, ddof=1) / np.sqrt(n) if len(v) == n else None, len(v))
             for v in valeurs]
 
+
 class App:
     def __init__(self, root):
         self.root, self.lasers, self.occupe = root, [], False
@@ -408,7 +486,8 @@ class App:
         self.calib_txt = tk.StringVar(value="Aucune raie enregistrée")
         self.laser_nm = tk.StringVar(value="532")
         self.laser_verif = tk.BooleanVar()
-        self.txt_reference = None
+        self.txt_reference = None      # (nom du TXT, texte du champ, nm numérique)
+        self.racine_calib = DOSSIER_LASERS_PROFS
         self.commandes = []
 
         root.title("Spectromètre — acquisition")
@@ -474,6 +553,7 @@ class App:
         ttk.Checkbutton(
             laser, text="Raie de vérification", variable=self.laser_verif
         ).pack(anchor="w", pady=4)
+        bouton(laser, "Nouvelle calibration (choisir dossier)…", self.nouvelle_calib, pady=(0, 6))
         bouton(laser, "Capturer le laser (RAW)", self.ajouter_laser)
         bouton(laser, "Importer des captures laser…", self.choisir_calib, pady=(6, 0))
         bouton(laser, "Désactiver l’étalonnage", self.sans_calib)
@@ -564,10 +644,27 @@ class App:
         try:
             nm = longueur_txt(chemin)
             self.laser_nm.set(f"{nm:.3f}")
-            self.txt_reference = (Path(chemin).name, self.laser_nm.get())
+            self.txt_reference = (Path(chemin).name, self.laser_nm.get(), nm)
             self.log(f"Pic du TXT : {nm:.3f} nm. Vérifiez qu’il s’agit du même laser.")
         except (OSError, ValueError) as exc:
             messagebox.showerror("Spectre de référence", str(exc), parent=self.root)
+
+    def nouvelle_calib(self):
+        chemin = filedialog.askdirectory(
+            parent=self.root, mustexist=False,
+            title="Dossier de la calibration (créez-le au besoin)",
+        )
+        if not chemin:
+            return
+        self.racine_calib = Path(chemin)
+        self.racine_calib.mkdir(parents=True, exist_ok=True)
+        try:   # reprend les raies déjà présentes, sinon repart à vide
+            self.lasers, dernier = charger_calibration_dossier(self.racine_calib)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Calibration", str(exc), parent=self.root)
+            return
+        self.afficher_calib(dernier)
+        self.log(f"Calibration : {self.racine_calib} ({len(self.lasers)} laser(s)).")
 
     def ajouter_laser(self):
         if self.cam is None:
@@ -587,6 +684,9 @@ class App:
                 if self.txt_reference and texte == self.txt_reference[1]
                 else "saisie manuelle"
             )
+            # nm de référence = pic du TXT si c'est lui qui a rempli le champ
+            if self.txt_reference and texte == self.txt_reference[1]:
+                nm = self.txt_reference[2]
         except (ValueError, tk.TclError) as exc:
             messagebox.showerror("Capture laser", str(exc), parent=self.root)
             return
@@ -604,23 +704,39 @@ class App:
             if not self.appliquer_expo():
                 return
 
-            dossier = (
-                Path(DOSSIER_SORTIE) / "calibration_lasers"
-                / datetime.now().strftime("laser_%Y%m%d_%H%M%S_%f")
-            )
-            px, intensite, alerte = profil_laser(self.images(str(dossier), n))
-            laser = Laser(px, nm, intensite.size, verif, source, alerte)
-            nouveaux = self.lasers + [laser]
-            verifier_lasers(nouveaux)
+            dossier_laser = Path(self.racine_calib) / nom_dossier_laser(nm)
+            dossier_laser.mkdir(parents=True, exist_ok=True)
+            meta = dossier_laser / "laser.json"
+            if meta.is_file():
+                nm_old = float(json.loads(meta.read_text(encoding="utf-8"))["nm"])
+                if abs(nm_old - nm) > 0.5:
+                    raise ValueError(
+                        f"{dossier_laser.name}/ contient déjà un laser à {nm_old:g} nm."
+                    )
+            dossier = dossier_laser / datetime.now().strftime("acq_%Y%m%d_%H%M%S")
 
-            meta = {"nm": nm, "verification": verif, "source": source}
-            (dossier / "laser.json").write_text(
-                json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+            for _ in self.images(str(dossier), n):   # sauvegarde sans tout garder en RAM
+                pass
+            meta.write_text(
+                json.dumps({"nm": nm, "verification": verif, "txt": source},
+                           ensure_ascii=False),
+                encoding="utf-8",
             )
+
+            # relit toutes les acquisitions de ce laser et remplace la raie
+            laser, intensite = laser_depuis_dossier(dossier_laser)
+            nouveaux = [p for p in self.lasers if abs(p.nm - laser.nm) > 0.5] + [laser]
+            verifier_lasers(nouveaux)
             self.lasers = nouveaux
             self.afficher_calib((laser, intensite))
             self.nb.select(2)
-            self.log(f"Laser {nm:g} nm enregistré au pixel {px:.2f}.")
+            self.log(
+                f"Laser {nm:g} nm : acquisition {laser.n_acq} enregistrée, "
+                f"pixel moyen {laser.px:.2f} ± {laser.u_px:.2f}."
+            )
+            if laser.n_acq == 1:
+                self.log("Une seule acquisition : refaites-en au moins une pour estimer u_px.")
+            alerte = laser.alerte
             if alerte:
                 self.log_pic([laser])
                 messagebox.showwarning(
@@ -629,53 +745,25 @@ class App:
                     "Pour un centre plus fiable, réduisez l’exposition et recommencez.",
                     parent=self.root,
                 )
-        except (OSError, RuntimeError, ValueError, tk.TclError) as exc:
+        except (OSError, RuntimeError, ValueError, KeyError, tk.TclError) as exc:
             messagebox.showerror("Capture laser", str(exc), parent=self.root)
         finally:
             self.occupation(False)
 
     def choisir_calib(self):
-        chemin = filedialog.askdirectory(parent=self.root, title="Dossier de captures laser RAW")
+        chemin = filedialog.askdirectory(parent=self.root, title="Dossier de calibration")
         if not chemin:
             return
-
         self.occupation(True)
         try:
-            dossier = Path(chemin)
-            if dossier.resolve() == DOSSIER_LASERS_PROFS.resolve():
-                self.lasers, dernier = charger_lasers_profs()
-                self.afficher_calib(dernier)
-                self.nb.select(2)
-                self.log(f"{len(self.lasers)} lasers chargés depuis {dossier}.")
-                self.log_pic(self.lasers)
-                return
-            nouveaux, dernier = [], None
-            for d in [dossier] + sorted(p for p in dossier.iterdir() if p.is_dir()):
-                meta = d / "laser.json"
-                nom = re.search(r"(\d+(?:[.,]\d+)?)\s*nm", d.name, re.I)
-                fichiers = sorted(d.glob("raw_*.npy")) or sorted((d / "images").glob("raw_*.npy"))
-                if meta.is_file():
-                    infos = json.loads(meta.read_text(encoding="utf-8"))
-                    nm = float(infos["nm"])
-                    verif, source = infos["verification"], infos["source"]
-                elif nom and fichiers:
-                    nm = float(nom.group(1).replace(",", "."))
-                    verif, source = False, d.name
-                else:
-                    continue
-
-                px, intensite, alerte = profil_laser(np.load(f) for f in fichiers)
-                laser = Laser(px, nm, intensite.size, verif, source, alerte)
-                nouveaux.append(laser)
-                dernier = (laser, intensite)
-
-            if not nouveaux:
-                raise ValueError("Aucune capture laser reconnue dans ce dossier.")
-            verifier_lasers(nouveaux)
-            self.lasers = nouveaux
+            lasers, dernier = charger_calibration_dossier(chemin)
+            if not lasers:
+                raise ValueError("Aucun dossier laser reconnu (laser.json absent).")
+            self.racine_calib, self.lasers = Path(chemin), lasers
             self.afficher_calib(dernier)
-            self.log_pic(self.lasers)
             self.nb.select(2)
+            self.log(f"{len(lasers)} lasers chargés depuis {chemin}.")
+            self.log_pic(self.lasers)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             messagebox.showerror("Dossier de calibration", str(exc), parent=self.root)
         finally:
@@ -688,7 +776,7 @@ class App:
         sinon (None, description de l'erreur).
         """
         try:
-            return charger_lasers_profs(), None
+            return charger_lasers_profs(self.racine_calib), None
         except Exception as exc:  # on veut voir toute erreur, pas la masquer
             return None, f"{type(exc).__name__} : {exc}"
 
@@ -747,7 +835,8 @@ class App:
     def afficher_calib(self, mesure=None):
         n_verif = sum(p.verification for p in self.lasers)
         self.calib_txt.set(
-            f"Raies : {len(self.lasers) - n_verif} ajustement, {n_verif} vérification"
+            f"Raies : {len(self.lasers) - n_verif} ajustement, {n_verif} vérification\n"
+            f"Dossier : {Path(self.racine_calib).name}"
         )
         self.fig_cal.clear()
         bas = self.fig_cal.subplots()
@@ -773,8 +862,11 @@ class App:
             ):
                 pts = [p for p in self.lasers if p.verification == verif]
                 if pts:
-                    bas.scatter([p.px for p in pts], [p.nm for p in pts],
-                                color=couleur, label=nom)
+                    bas.errorbar(
+                        [p.px for p in pts], [p.nm for p in pts],
+                        xerr=[p.u_px for p in pts], yerr=[p.u_nm for p in pts],
+                        fmt="o", color=couleur, capsize=3, label=nom,
+                    )
                     for p in pts:
                         bas.annotate(
                             f"{p.nm:g} nm",
@@ -785,7 +877,8 @@ class App:
                             color=couleur,
                         )
                     lignes.extend(
-                        f"{nom}  {p.nm:g} nm  |  {p.px:.2f} px  |  {p.source}"
+                        f"{nom}  {p.nm:g} nm  |  {p.px:.2f} ± {p.u_px:.2f} px "
+                        f"({p.n_acq} acq)  |  {p.source}"
                         for p in pts
                     )
             bas.legend(fontsize=8)
@@ -905,7 +998,7 @@ class App:
         if sat > 0.1:
             self.log(f"ATTENTION : {sat:.2f} % de photosites saturés. Réduisez l’exposition.")
         return np.array(profs), bande
-    
+
     def lire_coupure_theorique(self):
         texte = self.coupure_theo.get().strip()
         incertitude = self.u_coupure_theo.get().strip()
@@ -925,7 +1018,7 @@ class App:
         if u is not None and (not np.isfinite(u) or u < 0 or not np.isfinite(nm + u)):
             raise ValueError("L’incertitude théorique doit être finie, positive ou nulle.")
         return nm, u
-    
+
     def sequence(self):
         if self.cam is None:
             messagebox.showinfo("Caméra", "Pas de caméra : utilisez « Charger une acquisition ».", parent=self.root)
@@ -1041,8 +1134,6 @@ class App:
         )
         if len(raies) == 1:
             lignes.append("Une seule raie de vérification. L’estimation de u_cal est indicative.")
-        if len(raies) == 1:
-            lignes.append("Une seule raie de vérification. L’estimation de u_cal est indicative.")
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -1062,17 +1153,16 @@ class App:
             )
 
             for nom, c, (u_stat, nb) in zip(
-                ("montante", "descendante"), centres, incertitudes):
+                    ("montante", "descendante"), centres, incertitudes):
                 if c is None:
                     continue
 
                 # u_reg à la position de la coupure (interpolé sur l'axe croissant)
                 u_reg = (float(np.interp(c, x[ordre], s_reg[ordre]))
-                        if s_reg is not None else None)
+                         if s_reg is not None else None)
                 parts = [v for v in (u_stat, u_cal, u_reg) if v is not None]
                 u = float(np.sqrt(sum(v**2 for v in parts))) if parts else None
                 pts_ang.append((a, nom, c, u))
-
 
                 valeur = formater(c, u)
 
@@ -1084,6 +1174,8 @@ class App:
                     detail.append("répétabilité indisponible : au moins 2 images par série")
                 else:
                     detail.append(f"coupure introuvable sur {n_paires - nb}/{n_paires} paires")
+                if u_reg is not None:
+                    detail.append(f"u_reg = {u_reg:.3g} nm")
 
                 txt.append(valeur)
                 lignes.append(f"    {nom} : {valeur} ({', '.join(detail)})")
@@ -1136,8 +1228,9 @@ class App:
             f"Images par acquisition : {n_img}",
             f"RAW : {BLANC + 1} niveaux, noir = dark",
             f"Coupure : {FRAC:.0%} du 99e percentile de T valide",
-            f"Répétabilité : écart-type des coupures par paire d'images, divisé par √N",
+            "Répétabilité : écart-type des coupures par paire d'images, divisé par √N",
             "Barres horizontales : incertitude-type (k=1)",
+            f"Dossier de calibration : {self.racine_calib}",
         ]
         Path(dossier, "parametres.txt").write_text(
             "\n".join(parametres + lignes) + "\n", encoding="utf-8"
@@ -1221,7 +1314,7 @@ class App:
 
         for nom, couleur in (("montante", "tab:blue"), ("descendante", "tab:red")):
             pts = sorted((a, c, 0 if u is None else u)
-                        for a, n, c, u in self.pts_angle if n == nom)
+                         for a, n, c, u in self.pts_angle if n == nom)
             if not pts:
                 continue
             a, c, u = (np.array(v) for v in zip(*pts))
@@ -1232,7 +1325,7 @@ class App:
         if self.theorie is not None:
             nm, u_theo = self.theorie
             label = (f"Coupure théorique : {nm:g} nm" if not u_theo
-                    else f"Coupure théorique : ({nm:g} ± {u_theo:g}) nm")
+                     else f"Coupure théorique : ({nm:g} ± {u_theo:g}) nm")
             if u_theo:
                 ax.axhspan(nm - u_theo, nm + u_theo, color="0.2", alpha=0.13, zorder=0)
             ax.axhline(nm, color="0.2", ls=":", lw=1.5, label=label)
@@ -1247,6 +1340,7 @@ class App:
             ax.legend(fontsize=8)
         self.fig_ang.tight_layout()
         self.canvas_ang.draw_idle()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
